@@ -32,6 +32,11 @@ SYSCTL_FILE="/etc/sysctl.d/99-${APP}.conf"
 RUN_DIR="/run/${APP}"
 REG="${RUN_DIR}/sa.list"
 UDP_PID_FILE="${RUN_DIR}/udp.pid"
+HEARTBEAT_FILE="${RUN_DIR}/heartbeat"
+HEARTBEAT_MAX_AGE=120                    # seconds; external healthcheck restarts the service if the daemon stops touching this
+HEALTHCHECK_BIN="/usr/local/bin/${APP}-healthcheck.sh"
+HEALTHCHECK_CRON="/etc/cron.d/${APP}-healthcheck"
+CLOCK_JUMP_TOLERANCE=30                  # seconds of drift between checks treated as a real clock step, not scheduling jitter
 
 IF_NAME="espt0"
 IF_ID=42
@@ -278,6 +283,39 @@ ensure_deps() {
   for c in "${missing[@]}"; do
     have "$c" || { err "Could not install '$c'. Install it manually and run again."; return 1; }
   done
+  return 0
+}
+
+# The hourly key epoch is derived purely from wall-clock time on each side, with
+# no handshake to reconcile it. An unsynced clock that later "steps" to correct
+# itself (common in the first hours after a VPS boots) can silently push one
+# side's epoch out of the other's accepted window - the tunnel looks perfectly
+# fine, then goes fully dark until something rebuilds it. Make sure NTP is on.
+ensure_time_sync() {
+  local synced
+  if ! have timedatectl; then
+    warn "timedatectl not found - could not verify NTP sync. Make sure both servers'"
+    warn "clocks are NTP-synced (chrony/systemd-timesyncd); this tunnel's hourly keys"
+    warn "depend on it, and a clock jump on either side can silently break the tunnel."
+    return 0
+  fi
+  synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)
+  if [[ $synced != yes ]]; then
+    warn "System clock is not yet NTP-synchronized (NTPSynchronized=${synced:-unknown})."
+    if have systemctl && systemctl list-unit-files systemd-timesyncd.service &>/dev/null; then
+      info "Enabling systemd-timesyncd and waiting a few seconds for it to sync..."
+      systemctl enable --now systemd-timesyncd >/dev/null 2>&1
+      sleep 5
+      synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)
+    fi
+    if [[ $synced != yes ]]; then
+      warn "Clock is still not confirmed synced. Because key epochs are derived from"
+      warn "wall-clock time, an unsynced clock that later steps to correct itself can"
+      warn "cause a sudden, total disconnect hours after boot (fine, then dead, until"
+      warn "the next manual restart). Fix NTP on BOTH servers before relying on this."
+      confirm "Continue installing anyway?" n || return 1
+    fi
+  fi
   return 0
 }
 
@@ -554,8 +592,19 @@ setup_all() {
 # ------------------------------------------------------------------------------
 #  Daemon (runs under systemd): setup, hourly key rotation, health watchdog
 # ------------------------------------------------------------------------------
+log_forensics() {   # log_forensics "reason" - snapshot state right before a forced rebuild,
+                     # so if this happens again the journal shows *why*, not just *that*.
+  log "----- forensic snapshot before rebuild: $1 -----"
+  log "clock: $(date -u '+%F %T UTC')  ntp_synced: $(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo unknown)"
+  ip -s xfrm state 2>&1          | while IFS= read -r l; do log "xfrm-state: $l"; done
+  ip -s link show "$IF_NAME" 2>&1 | while IFS= read -r l; do log "link: $l"; done
+  dmesg -T 2>&1 | tail -n 20      | while IFS= read -r l; do log "dmesg: $l"; done
+  log "----- end forensic snapshot -----"
+}
+
 cmd_daemon() {
-  local tries=0 fails=0 last_fix=0 peer_state="unknown" e now
+  local tries=0 fails=0 rotate_fails=0 last_fix=0 peer_state="unknown"
+  local e now prev_now clock_drift
   load_config || { log "ERROR: missing or invalid $CONF"; exit 1; }
   mkdir -p "$RUN_DIR"
   trap 'log "stop signal received"; exit 0' TERM INT
@@ -565,21 +614,54 @@ cmd_daemon() {
     sleep 2
   done
   setup_all || { log "ERROR: setup failed"; exit 1; }
+  prev_now=$(date +%s)
 
   while true; do
+    touch "$HEARTBEAT_FILE" 2>/dev/null   # external healthcheck (cron) watches this
     sleep 5 &
     wait $!
+    now=$(date +%s)
+
+    # --- clock-jump guard --------------------------------------------------
+    # Key epochs are derived purely from wall-clock time with no handshake, so
+    # if the clock steps (NTP correction, hypervisor clock reset, ...) the two
+    # sides can silently fall out of sync. Detect it directly: this loop should
+    # take ~5s per iteration; a bigger gap means the wall clock jumped.
+    clock_drift=$(( now - prev_now - 5 ))
+    prev_now=$now
+    if (( clock_drift < -CLOCK_JUMP_TOLERANCE || clock_drift > CLOCK_JUMP_TOLERANCE )); then
+      log "WARN: system clock jumped by ${clock_drift}s between checks - forcing full resync"
+      log_forensics "clock jump of ${clock_drift}s"
+      route_info "$PEER_PUB" && setup_all
+      fails=0; rotate_fails=0; last_fix=$now
+      continue
+    fi
 
     # --- hourly key rotation (make-before-break, no packet loss) ---
-    e=$(( $(date +%s) / EPOCH_LEN ))
+    e=$(( now / EPOCH_LEN ))
     if (( e != CUR_EPOCH )); then
-      log "key rotation: epoch $CUR_EPOCH -> $e"
-      if install_epoch "$e"; then CUR_EPOCH=$e; else log "WARN: key rotation failed, will retry"; fi
+      if install_epoch "$e"; then
+        log "key rotation: epoch $CUR_EPOCH -> $e (ntp_synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo unknown))"
+        CUR_EPOCH=$e; rotate_fails=0
+      else
+        rotate_fails=$(( rotate_fails + 1 ))
+        log "WARN: key rotation to epoch $e failed ($rotate_fails in a row)"
+        # Don't retry the same failure forever: if it keeps failing, the
+        # outbound SA stays stuck on the old epoch until the peer eventually
+        # ages it out of its own accepted window - a slow, total blackout.
+        if (( rotate_fails >= 3 )); then
+          log "key rotation kept failing - forcing full rebuild"
+          log_forensics "key rotation failure"
+          route_info "$PEER_PUB" && setup_all
+          rotate_fails=0
+        fi
+      fi
     fi
 
     # --- watchdog ---
     if ! ip link show "$IF_NAME" >/dev/null 2>&1; then
       log "WARN: interface $IF_NAME vanished - rebuilding"
+      log_forensics "interface missing"
       route_info "$PEER_PUB" && setup_all
       continue
     fi
@@ -590,9 +672,9 @@ cmd_daemon() {
       fails=$(( fails + 1 ))
       if (( fails == 3 )); then peer_state=down; log "peer $PEER_INNER not answering for ~15s"; fi
       if (( fails >= 12 )); then
-        now=$(date +%s)
         if (( now - last_fix >= 180 )); then
           log "peer still unreachable - re-applying tunnel configuration"
+          log_forensics "peer unreachable"
           last_fix=$now
           route_info "$PEER_PUB" && setup_all
         fi
@@ -603,6 +685,19 @@ cmd_daemon() {
 }
 
 cmd_teardown() { teardown_all; log "tunnel torn down"; }
+
+# Re-apply the binary/systemd-unit/healthcheck-cron for an EXISTING install
+# after you've updated this script's code, without touching keys/config and
+# without the new-master-key/new-token dance that setup_iran/setup_kharej do.
+cmd_upgrade() {
+  load_config || { err "No existing config found at $CONF - use menu option 1 or 2 for a first install."; exit 1; }
+  install_self
+  write_unit
+  write_healthcheck
+  systemctl daemon-reload
+  systemctl restart "$APP"
+  ok "Binary, systemd unit and healthcheck cron refreshed; existing keys/config untouched."
+}
 
 cmd_fw() {
   load_config || exit 1
@@ -647,8 +742,44 @@ WantedBy=multi-user.target
 EOF
 }
 
+# External safety net, run by cron every 2 minutes. This deliberately does NOT
+# blindly restart a healthy tunnel - a periodic restart would itself cause the
+# packet loss / ping spikes the tunnel is supposed to avoid. It only restarts
+# when the daemon looks actually stuck or dead: heartbeat stale, service not
+# active, or the interface missing while the service claims to be running.
+write_healthcheck() {
+  cat > "$HEALTHCHECK_BIN" <<EOF
+#!/usr/bin/env bash
+now=\$(date +%s)
+reason=""
+hb_age=\$(( now - \$(stat -c %Y "$HEARTBEAT_FILE" 2>/dev/null || echo 0) ))
+if [[ ! -f "$HEARTBEAT_FILE" ]] || (( hb_age > $HEARTBEAT_MAX_AGE )); then
+  reason="stale/missing heartbeat (\${hb_age}s)"
+elif ! systemctl is-active --quiet ${APP}; then
+  reason="service not active"
+elif ! ip link show ${IF_NAME} >/dev/null 2>&1; then
+  reason="tunnel interface missing while service reports active"
+fi
+if [[ -n \$reason ]]; then
+  logger -t ${APP}-healthcheck "restarting ${APP}: \$reason" 2>/dev/null
+  systemctl restart ${APP}
+fi
+EOF
+  chmod 755 "$HEALTHCHECK_BIN"
+  cat > "$HEALTHCHECK_CRON" <<EOF
+# Auto-generated by ${APP} - external liveness check, see $HEALTHCHECK_BIN
+*/2 * * * * root $HEALTHCHECK_BIN
+EOF
+  chmod 644 "$HEALTHCHECK_CRON"
+}
+
+remove_healthcheck() {
+  rm -f "$HEALTHCHECK_BIN" "$HEALTHCHECK_CRON"
+}
+
 start_service() {
   write_unit
+  write_healthcheck
   systemctl daemon-reload
   systemctl enable "$APP" >/dev/null 2>&1
   systemctl restart "$APP"
@@ -753,8 +884,9 @@ setup_iran() {
   echo
   info "Setting up the IRAN server side (tunnel IP ${IP_IRAN})"
   ask_transport
-  ensure_deps  || { pause; return; }
-  check_kernel || { pause; return; }
+  ensure_deps      || { pause; return; }
+  ensure_time_sync || { pause; return; }
+  check_kernel     || { pause; return; }
 
   det=$(detect_public_ip)
   while true; do
@@ -805,8 +937,9 @@ setup_kharej() {
     err "Invalid token (copy error?). Copy it again from the Iran server (menu option 8)."
   done
   MODE=$T_MODE
-  ensure_deps  || { pause; return; }
-  check_kernel || { pause; return; }
+  ensure_deps      || { pause; return; }
+  ensure_time_sync || { pause; return; }
+  check_kernel     || { pause; return; }
 
   IRAN_IP=$T_IRAN; KHAREJ_IP=$T_KHAREJ; UDP_PORT=$T_UDP
   PORTS=$(norm_ports "$T_PORTS"); FWD_PROTO=$T_PROTO; MASTER=$T_MASTER; ROLE=kharej
@@ -849,6 +982,12 @@ cmd_status() {
   else echo "Transport     : raw ESP (IP protocol 50)"; fi
   echo "Cipher        : AES-256-GCM, MTU $MTU, next key rotation in $((left / 60)) min (epoch $epoch)"
   if [[ $st == active ]]; then echo "Service       : ${C_G}active${C_0}"; else echo "Service       : ${C_R}${st}${C_0}"; fi
+  echo "NTP synced    : $(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo unknown)"
+  if [[ -f $HEARTBEAT_FILE ]]; then
+    echo "Watchdog      : alive ($(( $(date +%s) - $(stat -c %Y "$HEARTBEAT_FILE" 2>/dev/null || echo 0) ))s since last check)"
+  else
+    echo "Watchdog      : ${C_R}no heartbeat file${C_0}"
+  fi
 
   if ip link show "$IF_NAME" >/dev/null 2>&1; then
     echo "Interface     : $(ip -br addr show "$IF_NAME" | awk '{print $1, $2, $3}')"
@@ -918,6 +1057,7 @@ uninstall_all() {
   confirm "Remove the tunnel completely (service, interface, keys, firewall rules)?" n || return
   systemctl disable --now "$APP" >/dev/null 2>&1
   teardown_all
+  remove_healthcheck
   rm -f "$UNIT_FILE" "$SYSCTL_FILE"
   rm -rf "$CONF_DIR" "$RUN_DIR"
   systemctl daemon-reload
@@ -997,7 +1137,7 @@ menu() {
 }
 
 usage() {
-  echo "Usage: $0 [menu|status|daemon|teardown|fw]"
+  echo "Usage: $0 [menu|status|daemon|teardown|fw|upgrade]"
 }
 
 main() {
@@ -1007,6 +1147,7 @@ main() {
     daemon)   need_root; cmd_daemon ;;
     teardown) need_root; cmd_teardown ;;
     fw)       need_root; cmd_fw ;;
+    upgrade)  need_root; cmd_upgrade ;;
     *)        usage; exit 1 ;;
   esac
 }
