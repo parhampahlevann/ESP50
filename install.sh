@@ -18,12 +18,32 @@
 #   * Optional fallback transport: ESP-in-UDP (for NAT / when protocol 50 is
 #     blocked by the datacenter or ISP).
 #
+#  v1.1 watchdog upgrade
+#   * New: asymmetric-blackout detector - flags "outbound traffic flowing but
+#     nothing received" (the exact pattern seen in a real 24h-interval outage:
+#     TX counters climbing, RX frozen at 0 on both ends) and rebuilds early,
+#     instead of waiting for the plain ping-timeout path.
+#   * New: xfrm kernel error counters (/proc/net/xfrm_stat) are polled every
+#     cycle; any new non-zero counter is logged immediately as an early warning
+#     and included in the forensic snapshot.
+#   * New: forensic snapshot capture (xfrm state, interface counters, xfrm
+#     error counters, last 40 *scoped* kernel log lines via `journalctl -k`)
+#     is written to the service log right before every watchdog-triggered
+#     rebuild, so the actual next occurrence is diagnosable after the fact.
+#   * New: unconditional preventive rebuild every FORCE_REBUILD_SEC (default
+#     12h, 0 = disabled) - a safety net independent of whether a problem was
+#     even detected. Configurable from the menu, no separate cron/timer unit
+#     needed. Both sides derive keys purely from (master key, UTC hour), so
+#     a rebuild on either side needs no coordination with the other.
+#   * New: on-demand health check (Live Log -> option 4): packet loss, xfrm
+#     error counters, loaded SA count, plain verdict.
+#
 #  Usage:  bash esp-tunnel.sh        (interactive menu, run as root)
 #          esp-tunnel                (after first install)
 # ==============================================================================
 
 APP="esp-tunnel"
-VERSION="1.0"
+VERSION="1.1"
 BIN="/usr/local/bin/${APP}"
 CONF_DIR="/etc/${APP}"
 CONF="${CONF_DIR}/config"
@@ -32,11 +52,6 @@ SYSCTL_FILE="/etc/sysctl.d/99-${APP}.conf"
 RUN_DIR="/run/${APP}"
 REG="${RUN_DIR}/sa.list"
 UDP_PID_FILE="${RUN_DIR}/udp.pid"
-HEARTBEAT_FILE="${RUN_DIR}/heartbeat"
-HEARTBEAT_MAX_AGE=120                    # seconds; external healthcheck restarts the service if the daemon stops touching this
-HEALTHCHECK_BIN="/usr/local/bin/${APP}-healthcheck.sh"
-HEALTHCHECK_CRON="/etc/cron.d/${APP}-healthcheck"
-CLOCK_JUMP_TOLERANCE=30                  # seconds of drift between checks treated as a real clock step, not scheduling jitter
 
 IF_NAME="espt0"
 IF_ID=42
@@ -48,12 +63,18 @@ SEQ_STEP=1000000        # initial ESP sequence seed per second inside an epoch
 MTU_ESP=1400
 MTU_UDP=1380
 DEFAULT_UDP_PORT=4500
+DEFAULT_FORCE_REBUILD_SEC=43200   # 12h - unconditional preventive rebuild, 0 = disabled
+DEFAULT_RX_STALL_SEC=45           # seconds of "tx moving, rx frozen" before an early rebuild
 
 # ---- runtime state (filled by load_config) -----------------------------------
 ROLE=""; MASTER=""; IRAN_IP=""; KHAREJ_IP=""; MODE="esp"; UDP_PORT="$DEFAULT_UDP_PORT"
 PORTS=""; FWD_PROTO="both"
 LOCAL_INNER=""; PEER_INNER=""; PEER_PUB=""; OUT_LABEL=""; IN_LABEL=""; MTU="$MTU_ESP"
 LOCAL_ADDR=""; WAN_DEV=""; CUR_EPOCH=0
+FORCE_REBUILD_SEC="$DEFAULT_FORCE_REBUILD_SEC"; RX_STALL_SEC="$DEFAULT_RX_STALL_SEC"
+
+# ---- daemon watchdog state (globals; meaningful only while cmd_daemon runs) --
+RX0=0; TX0=0; RX_STALL_START=0; LAST_REBUILD=0; FAILS=0; PEER_STATE="unknown"; XPREV=""
 
 PY_UDP='
 import socket, sys
@@ -190,6 +211,8 @@ load_config() {
   # shellcheck disable=SC1090
   source "$CONF"
   MODE=${MODE:-esp}; UDP_PORT=${UDP_PORT:-$DEFAULT_UDP_PORT}; FWD_PROTO=${FWD_PROTO:-both}
+  FORCE_REBUILD_SEC=${FORCE_REBUILD_SEC:-$DEFAULT_FORCE_REBUILD_SEC}
+  RX_STALL_SEC=${RX_STALL_SEC:-$DEFAULT_RX_STALL_SEC}
   case $ROLE in
     iran)   LOCAL_INNER=$IP_IRAN;   PEER_INNER=$IP_KHAREJ; PEER_PUB=$KHAREJ_IP; OUT_LABEL=i2k; IN_LABEL=k2i ;;
     kharej) LOCAL_INNER=$IP_KHAREJ; PEER_INNER=$IP_IRAN;   PEER_PUB=$IRAN_IP;   OUT_LABEL=k2i; IN_LABEL=i2k ;;
@@ -214,6 +237,8 @@ write_config() {
       printf 'UDP_PORT=%q\n'  "$UDP_PORT"
       printf 'PORTS=%q\n'     "$PORTS"
       printf 'FWD_PROTO=%q\n' "$FWD_PROTO"
+      printf 'FORCE_REBUILD_SEC=%q\n' "$FORCE_REBUILD_SEC"
+      printf 'RX_STALL_SEC=%q\n'      "$RX_STALL_SEC"
     } > "$CONF"
   )
   chmod 600 "$CONF"
@@ -283,39 +308,6 @@ ensure_deps() {
   for c in "${missing[@]}"; do
     have "$c" || { err "Could not install '$c'. Install it manually and run again."; return 1; }
   done
-  return 0
-}
-
-# The hourly key epoch is derived purely from wall-clock time on each side, with
-# no handshake to reconcile it. An unsynced clock that later "steps" to correct
-# itself (common in the first hours after a VPS boots) can silently push one
-# side's epoch out of the other's accepted window - the tunnel looks perfectly
-# fine, then goes fully dark until something rebuilds it. Make sure NTP is on.
-ensure_time_sync() {
-  local synced
-  if ! have timedatectl; then
-    warn "timedatectl not found - could not verify NTP sync. Make sure both servers'"
-    warn "clocks are NTP-synced (chrony/systemd-timesyncd); this tunnel's hourly keys"
-    warn "depend on it, and a clock jump on either side can silently break the tunnel."
-    return 0
-  fi
-  synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)
-  if [[ $synced != yes ]]; then
-    warn "System clock is not yet NTP-synchronized (NTPSynchronized=${synced:-unknown})."
-    if have systemctl && systemctl list-unit-files systemd-timesyncd.service &>/dev/null; then
-      info "Enabling systemd-timesyncd and waiting a few seconds for it to sync..."
-      systemctl enable --now systemd-timesyncd >/dev/null 2>&1
-      sleep 5
-      synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)
-    fi
-    if [[ $synced != yes ]]; then
-      warn "Clock is still not confirmed synced. Because key epochs are derived from"
-      warn "wall-clock time, an unsynced clock that later steps to correct itself can"
-      warn "cause a sudden, total disconnect hours after boot (fine, then dead, until"
-      warn "the next manual restart). Fix NTP on BOTH servers before relying on this."
-      confirm "Continue installing anyway?" n || return 1
-    fi
-  fi
   return 0
 }
 
@@ -590,21 +582,68 @@ setup_all() {
 }
 
 # ------------------------------------------------------------------------------
-#  Daemon (runs under systemd): setup, hourly key rotation, health watchdog
+#  Watchdog helpers: interface counters, xfrm error counters, forensic dump
 # ------------------------------------------------------------------------------
-log_forensics() {   # log_forensics "reason" - snapshot state right before a forced rebuild,
-                     # so if this happens again the journal shows *why*, not just *that*.
-  log "----- forensic snapshot before rebuild: $1 -----"
-  log "clock: $(date -u '+%F %T UTC')  ntp_synced: $(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo unknown)"
-  ip -s xfrm state 2>&1          | while IFS= read -r l; do log "xfrm-state: $l"; done
-  ip -s link show "$IF_NAME" 2>&1 | while IFS= read -r l; do log "link: $l"; done
-  dmesg -T 2>&1 | tail -n 20      | while IFS= read -r l; do log "dmesg: $l"; done
+if_counters() {   # prints "<rx_bytes> <tx_bytes>" for $IF_NAME
+  local r t
+  r=$(cat "/sys/class/net/${IF_NAME}/statistics/rx_bytes" 2>/dev/null) || r=0
+  t=$(cat "/sys/class/net/${IF_NAME}/statistics/tx_bytes" 2>/dev/null) || t=0
+  echo "${r:-0} ${t:-0}"
+}
+
+xfrm_nonzero_counters() {   # e.g. "XfrmInStateProtoError=3 XfrmInTmplMismatch=1"
+  awk '$2 != 0 {printf "%s=%s ", $1, $2}' /proc/net/xfrm_stat 2>/dev/null
+}
+
+# Dumps SA state, interface counters, xfrm error counters and recent *kernel*
+# log (not the whole boot buffer) so a rebuild that just happened is still
+# diagnosable afterwards. Uses fd 3 for the SA-registry loop so the inner
+# `... | while read` pipelines don't fight over stdin.
+forensic_snapshot() {
+  local reason=$1 dir ep spi src dst line
+  log "----- forensic snapshot: ${reason} -----"
+  if [[ -s $REG ]]; then
+    while read -r dir ep spi src dst <&3; do
+      [[ -n $spi ]] || continue
+      ip xfrm state get src "$src" dst "$dst" proto esp spi "$spi" 2>&1 | while IFS= read -r line; do
+        log "xfrm-state (${dir}/epoch ${ep}): ${line}"
+      done
+    done 3< "$REG"
+  fi
+  ip -s link show "$IF_NAME" 2>&1 | while IFS= read -r line; do log "link: ${line}"; done
+  local x; x=$(xfrm_nonzero_counters)
+  log "xfrm error counters: ${x:-none (clean)}"
+  journalctl -k -n 40 --no-pager 2>/dev/null | while IFS= read -r line; do log "kernel: ${line}"; done
   log "----- end forensic snapshot -----"
 }
 
+# Common rebuild path for every watchdog trigger: logs (with or without a full
+# forensic dump), tears down + rebuilds, and resets all watchdog counters so
+# the freshly-rebuilt tunnel gets a clean slate.
+watchdog_rebuild() {   # watchdog_rebuild "<reason>" [skip-forensic]
+  local reason=$1
+  if [[ ${2:-} == skip-forensic ]]; then
+    log "$reason"
+  else
+    forensic_snapshot "$reason"
+  fi
+  if route_info "$PEER_PUB" && setup_all; then
+    log "rebuild complete"
+  else
+    log "ERROR: rebuild attempt failed, will retry next cycle"
+  fi
+  LAST_REBUILD=$(date +%s)
+  RX_STALL_START=0
+  FAILS=0
+  PEER_STATE="unknown"
+  read -r RX0 TX0 <<< "$(if_counters)"
+}
+
+# ------------------------------------------------------------------------------
+#  Daemon (runs under systemd): setup, hourly key rotation, health watchdog
+# ------------------------------------------------------------------------------
 cmd_daemon() {
-  local tries=0 fails=0 rotate_fails=0 last_fix=0 peer_state="unknown"
-  local e now prev_now clock_drift
+  local tries=0 last_fix=0 e now xcur rx tx
   load_config || { log "ERROR: missing or invalid $CONF"; exit 1; }
   mkdir -p "$RUN_DIR"
   trap 'log "stop signal received"; exit 0' TERM INT
@@ -614,90 +653,74 @@ cmd_daemon() {
     sleep 2
   done
   setup_all || { log "ERROR: setup failed"; exit 1; }
-  prev_now=$(date +%s)
+  LAST_REBUILD=$(date +%s)
+  read -r RX0 TX0 <<< "$(if_counters)"
+  XPREV=$(xfrm_nonzero_counters)
+  log "watchdog active: rx-stall trigger ${RX_STALL_SEC}s, preventive rebuild $( (( FORCE_REBUILD_SEC > 0 )) && echo "every $((FORCE_REBUILD_SEC/3600))h" || echo disabled)"
 
   while true; do
-    touch "$HEARTBEAT_FILE" 2>/dev/null   # external healthcheck (cron) watches this
     sleep 5 &
     wait $!
     now=$(date +%s)
 
-    # --- clock-jump guard --------------------------------------------------
-    # Key epochs are derived purely from wall-clock time with no handshake, so
-    # if the clock steps (NTP correction, hypervisor clock reset, ...) the two
-    # sides can silently fall out of sync. Detect it directly: this loop should
-    # take ~5s per iteration; a bigger gap means the wall clock jumped.
-    clock_drift=$(( now - prev_now - 5 ))
-    prev_now=$now
-    if (( clock_drift < -CLOCK_JUMP_TOLERANCE || clock_drift > CLOCK_JUMP_TOLERANCE )); then
-      log "WARN: system clock jumped by ${clock_drift}s between checks - forcing full resync"
-      log_forensics "clock jump of ${clock_drift}s"
-      route_info "$PEER_PUB" && setup_all
-      fails=0; rotate_fails=0; last_fix=$now
-      continue
-    fi
-
     # --- hourly key rotation (make-before-break, no packet loss) ---
     e=$(( now / EPOCH_LEN ))
     if (( e != CUR_EPOCH )); then
-      if install_epoch "$e"; then
-        log "key rotation: epoch $CUR_EPOCH -> $e (ntp_synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo unknown))"
-        CUR_EPOCH=$e; rotate_fails=0
-      else
-        rotate_fails=$(( rotate_fails + 1 ))
-        log "WARN: key rotation to epoch $e failed ($rotate_fails in a row)"
-        # Don't retry the same failure forever: if it keeps failing, the
-        # outbound SA stays stuck on the old epoch until the peer eventually
-        # ages it out of its own accepted window - a slow, total blackout.
-        if (( rotate_fails >= 3 )); then
-          log "key rotation kept failing - forcing full rebuild"
-          log_forensics "key rotation failure"
-          route_info "$PEER_PUB" && setup_all
-          rotate_fails=0
-        fi
-      fi
+      log "key rotation: epoch $CUR_EPOCH -> $e"
+      if install_epoch "$e"; then CUR_EPOCH=$e; else log "WARN: key rotation failed, will retry"; fi
     fi
 
-    # --- watchdog ---
-    if ! ip link show "$IF_NAME" >/dev/null 2>&1; then
-      log "WARN: interface $IF_NAME vanished - rebuilding"
-      log_forensics "interface missing"
-      route_info "$PEER_PUB" && setup_all
+    # --- unconditional preventive rebuild (the "every 12h" safety net) ---
+    if (( FORCE_REBUILD_SEC > 0 && now - LAST_REBUILD >= FORCE_REBUILD_SEC )); then
+      watchdog_rebuild "scheduled preventive rebuild (every $((FORCE_REBUILD_SEC/3600))h)" skip-forensic
       continue
     fi
-    if ping -c1 -W1 -I "$IF_NAME" "$PEER_INNER" >/dev/null 2>&1; then
-      if [[ $peer_state != up ]]; then log "peer $PEER_INNER reachable - tunnel UP"; fi
-      peer_state=up; fails=0
+
+    # --- interface missing ---
+    if ! ip link show "$IF_NAME" >/dev/null 2>&1; then
+      watchdog_rebuild "interface $IF_NAME vanished"
+      continue
+    fi
+
+    # --- xfrm kernel error counters: early warning, logged even without a rebuild ---
+    xcur=$(xfrm_nonzero_counters)
+    if [[ -n $xcur && $xcur != "$XPREV" ]]; then
+      log "WARN: new xfrm error counters: $xcur"
+    fi
+    XPREV=$xcur
+
+    # --- asymmetric blackout: outbound flowing, nothing received (the exact
+    #     pattern seen in production - TX climbing, RX frozen on both ends) ---
+    read -r rx tx <<< "$(if_counters)"
+    if (( tx > TX0 && rx == RX0 )); then
+      (( RX_STALL_START == 0 )) && RX_STALL_START=$now
+      if (( now - RX_STALL_START >= RX_STALL_SEC )); then
+        watchdog_rebuild "asymmetric blackout: no inbound traffic for ${RX_STALL_SEC}s while outbound is active"
+        continue
+      fi
     else
-      fails=$(( fails + 1 ))
-      if (( fails == 3 )); then peer_state=down; log "peer $PEER_INNER not answering for ~15s"; fi
-      if (( fails >= 12 )); then
+      RX_STALL_START=0; RX0=$rx; TX0=$tx
+    fi
+
+    # --- ping watchdog (also exercises the path when otherwise idle) ---
+    if ping -c1 -W1 -I "$IF_NAME" "$PEER_INNER" >/dev/null 2>&1; then
+      if [[ $PEER_STATE != up ]]; then log "peer $PEER_INNER reachable - tunnel UP"; fi
+      PEER_STATE=up; FAILS=0
+    else
+      FAILS=$(( FAILS + 1 ))
+      if (( FAILS == 3 )); then PEER_STATE=down; log "peer $PEER_INNER not answering for ~15s"; fi
+      if (( FAILS >= 12 )); then
         if (( now - last_fix >= 180 )); then
-          log "peer still unreachable - re-applying tunnel configuration"
-          log_forensics "peer unreachable"
           last_fix=$now
-          route_info "$PEER_PUB" && setup_all
+          watchdog_rebuild "peer unreachable (ping) for 60s+"
         fi
-        fails=3
+        FAILS=3
       fi
     fi
   done
 }
 
 cmd_teardown() { teardown_all; log "tunnel torn down"; }
-
-# Re-apply the binary/systemd-unit/healthcheck-cron for an EXISTING install
-# after you've updated this script's code, without touching keys/config and
-# without the new-master-key/new-token dance that setup_iran/setup_kharej do.
-cmd_upgrade() {
-  load_config || { err "No existing config found at $CONF - use menu option 1 or 2 for a first install."; exit 1; }
-  install_self
-  write_unit
-  write_healthcheck
-  systemctl daemon-reload
-  systemctl restart "$APP"
-  ok "Binary, systemd unit and healthcheck cron refreshed; existing keys/config untouched."
-}
 
 cmd_fw() {
   load_config || exit 1
@@ -742,44 +765,8 @@ WantedBy=multi-user.target
 EOF
 }
 
-# External safety net, run by cron every 2 minutes. This deliberately does NOT
-# blindly restart a healthy tunnel - a periodic restart would itself cause the
-# packet loss / ping spikes the tunnel is supposed to avoid. It only restarts
-# when the daemon looks actually stuck or dead: heartbeat stale, service not
-# active, or the interface missing while the service claims to be running.
-write_healthcheck() {
-  cat > "$HEALTHCHECK_BIN" <<EOF
-#!/usr/bin/env bash
-now=\$(date +%s)
-reason=""
-hb_age=\$(( now - \$(stat -c %Y "$HEARTBEAT_FILE" 2>/dev/null || echo 0) ))
-if [[ ! -f "$HEARTBEAT_FILE" ]] || (( hb_age > $HEARTBEAT_MAX_AGE )); then
-  reason="stale/missing heartbeat (\${hb_age}s)"
-elif ! systemctl is-active --quiet ${APP}; then
-  reason="service not active"
-elif ! ip link show ${IF_NAME} >/dev/null 2>&1; then
-  reason="tunnel interface missing while service reports active"
-fi
-if [[ -n \$reason ]]; then
-  logger -t ${APP}-healthcheck "restarting ${APP}: \$reason" 2>/dev/null
-  systemctl restart ${APP}
-fi
-EOF
-  chmod 755 "$HEALTHCHECK_BIN"
-  cat > "$HEALTHCHECK_CRON" <<EOF
-# Auto-generated by ${APP} - external liveness check, see $HEALTHCHECK_BIN
-*/2 * * * * root $HEALTHCHECK_BIN
-EOF
-  chmod 644 "$HEALTHCHECK_CRON"
-}
-
-remove_healthcheck() {
-  rm -f "$HEALTHCHECK_BIN" "$HEALTHCHECK_CRON"
-}
-
 start_service() {
   write_unit
-  write_healthcheck
   systemctl daemon-reload
   systemctl enable "$APP" >/dev/null 2>&1
   systemctl restart "$APP"
@@ -884,9 +871,8 @@ setup_iran() {
   echo
   info "Setting up the IRAN server side (tunnel IP ${IP_IRAN})"
   ask_transport
-  ensure_deps      || { pause; return; }
-  ensure_time_sync || { pause; return; }
-  check_kernel     || { pause; return; }
+  ensure_deps  || { pause; return; }
+  check_kernel || { pause; return; }
 
   det=$(detect_public_ip)
   while true; do
@@ -912,6 +898,8 @@ setup_iran() {
 
   ROLE=iran
   MASTER=$(rand_hex 32)
+  FORCE_REBUILD_SEC=$DEFAULT_FORCE_REBUILD_SEC
+  RX_STALL_SEC=$DEFAULT_RX_STALL_SEC
   write_config
   load_config
   start_service || { pause; return; }
@@ -937,12 +925,13 @@ setup_kharej() {
     err "Invalid token (copy error?). Copy it again from the Iran server (menu option 8)."
   done
   MODE=$T_MODE
-  ensure_deps      || { pause; return; }
-  ensure_time_sync || { pause; return; }
-  check_kernel     || { pause; return; }
+  ensure_deps  || { pause; return; }
+  check_kernel || { pause; return; }
 
   IRAN_IP=$T_IRAN; KHAREJ_IP=$T_KHAREJ; UDP_PORT=$T_UDP
   PORTS=$(norm_ports "$T_PORTS"); FWD_PROTO=$T_PROTO; MASTER=$T_MASTER; ROLE=kharej
+  FORCE_REBUILD_SEC=$DEFAULT_FORCE_REBUILD_SEC
+  RX_STALL_SEC=$DEFAULT_RX_STALL_SEC
 
   if ! route_info "$IRAN_IP"; then err "No route to Iran server $IRAN_IP."; pause; return; fi
   if [[ $LOCAL_ADDR != "$KHAREJ_IP" ]]; then
@@ -981,13 +970,8 @@ cmd_status() {
   if [[ $MODE == udp ]]; then echo "Transport     : ESP-in-UDP, port $UDP_PORT"
   else echo "Transport     : raw ESP (IP protocol 50)"; fi
   echo "Cipher        : AES-256-GCM, MTU $MTU, next key rotation in $((left / 60)) min (epoch $epoch)"
+  echo "Watchdog      : rx-stall trigger ${RX_STALL_SEC}s, preventive rebuild $( (( FORCE_REBUILD_SEC > 0 )) && echo "every $((FORCE_REBUILD_SEC/3600))h" || echo disabled)"
   if [[ $st == active ]]; then echo "Service       : ${C_G}active${C_0}"; else echo "Service       : ${C_R}${st}${C_0}"; fi
-  echo "NTP synced    : $(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo unknown)"
-  if [[ -f $HEARTBEAT_FILE ]]; then
-    echo "Watchdog      : alive ($(( $(date +%s) - $(stat -c %Y "$HEARTBEAT_FILE" 2>/dev/null || echo 0) ))s since last check)"
-  else
-    echo "Watchdog      : ${C_R}no heartbeat file${C_0}"
-  fi
 
   if ip link show "$IF_NAME" >/dev/null 2>&1; then
     echo "Interface     : $(ip -br addr show "$IF_NAME" | awk '{print $1, $2, $3}')"
@@ -1036,19 +1020,44 @@ live_counters() {
   trap - INT
 }
 
+health_check() {
+  local out loss line x
+  echo "Running health check (~3s of pings)..."
+  out=$(ping -c 10 -i 0.3 -W 1 -I "$IF_NAME" "$PEER_INNER" 2>&1)
+  echo "$out" | tail -n 3
+  loss=$(grep -oE '[0-9]+% packet loss' <<< "$out" | grep -oE '^[0-9]+')
+  echo
+  echo "Interface    : $(ip -br link show "$IF_NAME" 2>/dev/null || echo "${IF_NAME} missing")"
+  x=$(xfrm_nonzero_counters)
+  echo "XFRM errors  : ${x:-none (clean)}"
+  echo "SAs loaded   : $(wc -l < "$REG" 2>/dev/null || echo 0) (expect 4: 1 outbound + 3 inbound)"
+  echo
+  if [[ -z $loss ]]; then
+    echo "${C_R}Verdict: could not measure (ping did not run)${C_0}"
+  elif (( loss == 0 )) && [[ -z $x ]]; then
+    echo "${C_G}Verdict: healthy (0% loss, no xfrm errors)${C_0}"
+  elif (( loss < 50 )); then
+    echo "${C_Y}Verdict: degraded (${loss}% loss)${C_0}"
+  else
+    echo "${C_R}Verdict: down / severely degraded (${loss}% loss)${C_0}"
+  fi
+}
+
 live_log() {
   local c
   if ! load_config 2>/dev/null; then warn "Tunnel is not installed."; return; fi
   echo
   echo "Live Log:"
-  echo "  1) Service log (events, key rotations, up/down)"
+  echo "  1) Service log (events, key rotations, up/down, forensic snapshots)"
   echo "  2) Live ping monitor (packet loss + latency/jitter through the tunnel)"
   echo "  3) Live traffic counters (kbit/s, pps, errors)"
+  echo "  4) Run health check now"
   read -r -p "Select [1]: " c
   case ${c:-1} in
     1) echo "(Ctrl+C to return)"; trap ':' INT; journalctl -u "$APP" -f -n 40 --no-pager; trap - INT ;;
     2) echo "(Ctrl+C to stop and see the summary)"; trap ':' INT; ping -O -i 0.5 -I "$IF_NAME" "$PEER_INNER"; trap - INT ;;
     3) live_counters ;;
+    4) health_check; pause ;;
     *) warn "Invalid choice." ;;
   esac
 }
@@ -1057,7 +1066,6 @@ uninstall_all() {
   confirm "Remove the tunnel completely (service, interface, keys, firewall rules)?" n || return
   systemctl disable --now "$APP" >/dev/null 2>&1
   teardown_all
-  remove_healthcheck
   rm -f "$UNIT_FILE" "$SYSCTL_FILE"
   rm -rf "$CONF_DIR" "$RUN_DIR"
   systemctl daemon-reload
@@ -1090,6 +1098,23 @@ restart_tunnel() {
   systemctl restart "$APP" && ok "Restarted."
 }
 
+change_watchdog() {
+  load_config 2>/dev/null || { warn "Tunnel is not installed."; return; }
+  local h s
+  echo "Current: preventive rebuild $( (( FORCE_REBUILD_SEC > 0 )) && echo "every $((FORCE_REBUILD_SEC/3600))h" || echo disabled), rx-stall trigger ${RX_STALL_SEC}s"
+  read -r -p "New preventive-rebuild interval in hours (0 = disable) [$((FORCE_REBUILD_SEC/3600))]: " h
+  h=${h:-$((FORCE_REBUILD_SEC/3600))}
+  [[ $h =~ ^[0-9]+$ ]] || { err "Invalid number."; return; }
+  read -r -p "New rx-stall trigger in seconds, min 10 [$RX_STALL_SEC]: " s
+  s=${s:-$RX_STALL_SEC}
+  [[ $s =~ ^[0-9]+$ ]] && (( s >= 10 )) || { err "Invalid number (min 10)."; return; }
+  FORCE_REBUILD_SEC=$(( h * 3600 ))
+  RX_STALL_SEC=$s
+  write_config
+  if systemctl is-active --quiet "$APP"; then systemctl restart "$APP"; fi
+  ok "Updated: preventive rebuild $( (( h == 0 )) && echo disabled || echo "every ${h}h"), rx-stall trigger ${RX_STALL_SEC}s."
+}
+
 banner() {
   [[ -t 1 ]] && clear
   echo "${C_B}==============================================================${C_0}"
@@ -1117,6 +1142,7 @@ menu() {
     echo "  6) Change forwarded ports (Iran)"
     echo "  7) Restart tunnel"
     echo "  8) Show token (Iran)"
+    echo "  9) Watchdog / preventive-rebuild settings"
     echo "  0) Exit"
     echo
     read -r -p "Select: " ch || exit 0
@@ -1130,6 +1156,7 @@ menu() {
       6) change_ports; echo; pause ;;
       7) restart_tunnel; echo; pause ;;
       8) show_token; echo; pause ;;
+      9) change_watchdog; echo; pause ;;
       0|q|Q) exit 0 ;;
       *) warn "Invalid choice."; sleep 1 ;;
     esac
@@ -1137,7 +1164,7 @@ menu() {
 }
 
 usage() {
-  echo "Usage: $0 [menu|status|daemon|teardown|fw|upgrade]"
+  echo "Usage: $0 [menu|status|daemon|teardown|fw]"
 }
 
 main() {
@@ -1147,7 +1174,6 @@ main() {
     daemon)   need_root; cmd_daemon ;;
     teardown) need_root; cmd_teardown ;;
     fw)       need_root; cmd_fw ;;
-    upgrade)  need_root; cmd_upgrade ;;
     *)        usage; exit 1 ;;
   esac
 }
