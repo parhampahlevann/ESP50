@@ -5,24 +5,10 @@
 #    Iran server   : 10.10.10.2   (menu option 1)
 #    Kharej client : 10.10.10.1   (menu option 2)
 #
-#  How it works
-#   * Linux kernel XFRM (IPsec ESP) + an "xfrm interface" (espt0) on each side.
-#     No IKE daemon and no handshake: only encrypted ESP packets hit the wire.
-#   * Cipher: AES-256-GCM in the kernel (AES-NI accelerated, very light).
-#   * One random master key (shown once as a "token" on the Iran server).
-#     Per-direction session keys are derived from it and rotate every hour
-#     with zero downtime (both sides derive the same keys from the UTC clock;
-#     the previous/current/next hour inbound SAs are always loaded).
-#   * The Iran server DNATs the chosen ports to 10.10.10.1 through the tunnel.
-#     The xfrm policies only allow traffic between 10.10.10.2 <-> 10.10.10.1.
-#   * Optional fallback transport: ESP-in-UDP (for NAT / when protocol 50 is
-#     blocked by the datacenter or ISP).
-#
 #  v1.2 auto-recovery upgrade
-#   * New: Kernel-level XFRM flush and RCU delay handling to guarantee the
-#     watchdog can successfully rebuild the tunnel automatically if it drops,
-#     completely eliminating the need for manual uninstall/reinstall.
-#   * New: Fixed deterministic Master Key (PSK) based on user request.
+#   * Kernel-level XFRM flush and RCU delay handling to guarantee the
+#     watchdog can successfully rebuild the tunnel automatically if it drops.
+#   * Fixed deterministic Master Key (PSK) based on user request.
 #
 #  Usage:  bash esp-tunnel.sh        (interactive menu, run as root)
 #          esp-tunnel                (after first install)
@@ -1079,7 +1065,7 @@ uninstall_all() {
 
 change_ports() {
   load_config 2>/dev/null || { warn "Tunnel is not installed."; return; }
-  if [[ $ROLE != iran ]]; then warn "Ports are configured on the Iran server only."; return; }
+  if [[ $ROLE != iran ]]; then warn "Ports are configured on the Iran server only."; return; fi
   info "Current ports: [${PORTS}] (${FWD_PROTO})"
   ask_ports
   ask_fwd_proto
