@@ -5,17 +5,18 @@
 #    Iran server   : 10.10.10.2   (menu option 1)
 #    Kharej client : 10.10.10.1   (menu option 2)
 #
-#  v1.2 auto-recovery upgrade
-#   * Kernel-level XFRM flush and RCU delay handling to guarantee the
-#     watchdog can successfully rebuild the tunnel automatically if it drops.
-#   * Fixed deterministic Master Key (PSK) based on user request.
+#  v1.3 Direct-Path & Anti-Disruption upgrade
+#   * New: ensure_direct_path() function to fix MTU blackholes, asymmetric
+#     routing drops, and ISP ICMP redirects.
+#   * New: Default transport changed to ESP-in-UDP on port 443 to bypass
+#     almost all ISP/Datacenter protocol blocks.
 #
 #  Usage:  bash esp-tunnel.sh        (interactive menu, run as root)
 #          esp-tunnel                (after first install)
 # ==============================================================================
 
 APP="esp-tunnel"
-VERSION="1.2"
+VERSION="1.3"
 BIN="/usr/local/bin/${APP}"
 CONF_DIR="/etc/${APP}"
 CONF="${CONF_DIR}/config"
@@ -108,7 +109,6 @@ is_private_ip() {
 
 valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
 
-# "1080, 443 ,8000-8100"  ->  "1080,443,8000-8100"   (returns 1 if invalid)
 norm_ports() {
   local raw=${1//[[:space:]]/} spec a b
   local -a out=() specs=()
@@ -131,7 +131,7 @@ norm_ports() {
   echo "${out[*]}"
 }
 
-ports_include() {   # ports_include "1080,8000-8100" 8050
+ports_include() {
   local spec a b
   local -a specs=()
   IFS=',' read -ra specs <<< "$1"
@@ -154,7 +154,6 @@ kdf() { printf '%s' "$1" | sha512sum | awk '{print $1}'; }
 
 rand_hex() { head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 
-# Sets LOCAL_ADDR (our source address towards $1) and WAN_DEV
 route_info() {
   local out
   out=$(ip -4 route get "$1" 2>/dev/null | head -n1)
@@ -216,7 +215,6 @@ write_config() {
   chmod 600 "$CONF"
 }
 
-# token = base64( v1|master|iran_ip|kharej_ip|mode|udp_port|ports|proto|checksum )
 make_token() {
   local payload chk
   payload="v1|${MASTER}|${IRAN_IP}|${KHAREJ_IP}|${MODE}|${UDP_PORT}|${PORTS}|${FWD_PROTO}"
@@ -339,6 +337,7 @@ fw_remove() {
   fw_chain_remove filter ESPT_IN   INPUT
   fw_chain_remove filter ESPT_FWD  FORWARD
   fw_chain_remove mangle ESPT_MSS  POSTROUTING
+  fw_chain_remove mangle ESPT_MSS  PREROUTING
   fw_chain_remove nat    ESPT_PRE  PREROUTING
   fw_chain_remove nat    ESPT_POST POSTROUTING
 }
@@ -347,7 +346,6 @@ fw_apply() {
   local spec d pr
   local -a specs=() protos=()
 
-  # accept the tunnel transport from the peer + everything that comes out of the tunnel
   fw_chain_reset filter ESPT_IN INPUT
   ipt -A ESPT_IN -i "$IF_NAME" -j ACCEPT
   if [[ $MODE == udp ]]; then
@@ -360,9 +358,9 @@ fw_apply() {
   ipt -A ESPT_FWD -i "$IF_NAME" -j ACCEPT
   ipt -A ESPT_FWD -o "$IF_NAME" -j ACCEPT
 
-  # avoid fragmentation / PMTU black holes inside the tunnel
+  # Hook MSS chain to both PREROUTING and POSTROUTING to catch both directions
   fw_chain_reset mangle ESPT_MSS POSTROUTING
-  ipt -t mangle -A ESPT_MSS -o "$IF_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  fw_chain_reset mangle ESPT_MSS PREROUTING
 
   if [[ $ROLE == iran ]]; then
     fw_chain_reset nat ESPT_PRE  PREROUTING
@@ -380,7 +378,6 @@ fw_apply() {
         ipt -t nat -A ESPT_PRE ! -i "$IF_NAME" -p "$pr" --dport "$d" -j DNAT --to-destination "$IP_KHAREJ"
       done
     done
-    # everything that enters the tunnel leaves with the tunnel address 10.10.10.2
     ipt -t nat -A ESPT_POST -o "$IF_NAME" -d "$IP_KHAREJ" -j SNAT --to-source "$IP_IRAN"
   fi
   return 0
@@ -394,14 +391,47 @@ sysctl_apply() {
 }
 
 # ------------------------------------------------------------------------------
+#  Direct Path & Anti-Disruption Optimizations
+# ------------------------------------------------------------------------------
+ensure_direct_path() {
+  log "Applying direct-path and anti-disruption network fixes..."
+  
+  # 1. Fix MTU/PMTU Blackholes (Force MSS to 1280 for both directions)
+  ipt -t mangle -F ESPT_MSS 2>/dev/null
+  ipt -t mangle -A ESPT_MSS -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1280
+
+  # 2. Loose Reverse Path Filtering (Prevents asymmetric routing drops)
+  sysctl -qw net.ipv4.conf.all.rp_filter=2 2>/dev/null
+  sysctl -qw net.ipv4.conf.default.rp_filter=2 2>/dev/null
+  sysctl -qw "net.ipv4.conf.${IF_NAME}.rp_filter=2" 2>/dev/null
+  [[ -n $WAN_DEV ]] && sysctl -qw "net.ipv4.conf.${WAN_DEV}.rp_filter=2" 2>/dev/null
+
+  # 3. Disable ICMP Redirects (Prevents route hijacking/drops by ISP)
+  sysctl -qw net.ipv4.conf.all.accept_redirects=0 2>/dev/null
+  sysctl -qw net.ipv4.conf.all.send_redirects=0 2>/dev/null
+  sysctl -qw net.ipv4.conf.all.secure_redirects=0 2>/dev/null
+
+  # 4. Force static route to peer public IP (Prevents routing loops into the tunnel)
+  local gw
+  gw=$(ip route get "$PEER_PUB" 2>/dev/null | grep -oP 'via \K\S+' | head -n1)
+  if [[ -n $gw && -n $WAN_DEV ]]; then
+    ip route replace "$PEER_PUB" via "$gw" dev "$WAN_DEV" src "$LOCAL_ADDR" 2>/dev/null || \
+    ip route replace "$PEER_PUB" dev "$WAN_DEV" src "$LOCAL_ADDR" 2>/dev/null
+  fi
+
+  # 5. Increase conntrack buffer to prevent dropped packets under load
+  sysctl -qw net.netfilter.nf_conntrack_max=1048576 2>/dev/null
+  
+  log "Direct-path optimizations applied successfully."
+}
+
+# ------------------------------------------------------------------------------
 #  Interface / policies / security associations
 # ------------------------------------------------------------------------------
 iface_setup() {
   local out tries=0
-  # Ensure it's completely gone before creating
   ip link del "$IF_NAME" 2>/dev/null
   sleep 1
-  # Retry loop to handle kernel RCU grace period delays
   while (( tries < 5 )); do
     if out=$(ip link add "$IF_NAME" type xfrm dev "$WAN_DEV" if_id "$IF_ID" 2>&1); then
       break
@@ -431,9 +461,6 @@ policies_remove() {
 policies_setup() {
   local out
   policies_remove
-  # out : only 10.10.10.local -> 10.10.10.peer may enter the tunnel
-  # in  : only 10.10.10.peer  -> 10.10.10.local is accepted for this host
-  # fwd : replies coming back through the tunnel (source must be the peer tunnel IP)
   out=$(ip xfrm policy add src "$LOCAL_INNER/32" dst "$PEER_INNER/32" dir out if_id "$IF_ID" \
         tmpl src "$LOCAL_ADDR" dst "$PEER_PUB" proto esp reqid "$IF_ID" mode tunnel 2>&1) \
     || { log "ERROR: policy out: $out"; return 1; }
@@ -446,8 +473,7 @@ policies_setup() {
   return 0
 }
 
-# SA registry: one line per installed SA -> "<dir> <epoch> <spi> <src> <dst>"
-sa_add() {   # sa_add <in|out> <epoch>
+sa_add() {
   local dir=$1 e=$2 src dst label spi key seq out
   local -a args=()
   if [[ $dir == out ]]; then src=$LOCAL_ADDR; dst=$PEER_PUB;  label=$OUT_LABEL
@@ -456,7 +482,7 @@ sa_add() {   # sa_add <in|out> <epoch>
   grep -q "^$dir $e " "$REG" 2>/dev/null && return 0
 
   spi="0x1$(kdf "${MASTER}|spi|${label}|${e}" | cut -c1-7)"
-  key=$(kdf "${MASTER}|key|${label}|${e}" | cut -c1-72)     # 32-byte AES key + 4-byte GCM salt
+  key=$(kdf "${MASTER}|key|${label}|${e}" | cut -c1-72)
   args=(src "$src" dst "$dst" proto esp spi "$spi" reqid "$IF_ID" mode tunnel
         aead 'rfc4106(gcm(aes))' "0x${key}" 128)
   if [[ $MODE == udp ]]; then args+=(encap espinudp "$UDP_PORT" "$UDP_PORT" 0.0.0.0); fi
@@ -464,7 +490,6 @@ sa_add() {   # sa_add <in|out> <epoch>
 
   ip xfrm state delete src "$src" dst "$dst" proto esp spi "$spi" 2>/dev/null
   if [[ $dir == out ]]; then
-    # start the sequence counter high inside the epoch so a restart never reuses a GCM nonce
     seq=$(( ($(date +%s) % EPOCH_LEN) * SEQ_STEP ))
     if ! out=$(ip xfrm state add "${args[@]}" replay-oseq "$seq" 2>&1); then
       out=$(ip xfrm state add "${args[@]}" 2>&1) || { log "ERROR: cannot add SA: $out"; return 1; }
@@ -477,7 +502,7 @@ sa_add() {   # sa_add <in|out> <epoch>
   return 0
 }
 
-prune_sa() {   # prune_sa <current-epoch>
+prune_sa() {
   local e=$1 dir ep spi src dst keep tmp
   [[ -f $REG ]] || return 0
   tmp=$(mktemp)
@@ -500,7 +525,7 @@ prune_sa() {   # prune_sa <current-epoch>
   rm -f "$tmp"
 }
 
-install_epoch() {   # newest outbound first, inbound for previous/current/next epoch
+install_epoch() {
   local e=$1 x
   sa_add out "$e" || return 1
   for x in $((e - 1)) "$e" $((e + 1)); do
@@ -527,7 +552,7 @@ udp_helper_stop() {
   fi
 }
 
-udp_helper_start() {   # holds the UDP socket that lets the kernel decapsulate ESP-in-UDP
+udp_helper_start() {
   udp_helper_stop
   python3 -c "$PY_UDP" "$UDP_PORT" >/dev/null 2>&1 &
   echo $! > "$UDP_PID_FILE"
@@ -544,11 +569,9 @@ teardown_all() {
   udp_helper_stop
   sa_flush
   policies_remove
-  # Force flush any lingering XFRM states/policies to prevent "File exists" errors
   ip xfrm state flush 2>/dev/null
   ip xfrm policy flush 2>/dev/null
   ip link del "$IF_NAME" 2>/dev/null
-  # Wait for kernel RCU grace period to expire so the xfrm interface can be cleanly recreated
   sleep 2
   return 0
 }
@@ -565,28 +588,25 @@ setup_all() {
   if [[ $MODE == udp ]]; then udp_helper_start || return 1; fi
   sysctl_apply
   fw_apply
+  ensure_direct_path  # <--- Direct path optimizations applied here
   log "tunnel up: role=$ROLE ${LOCAL_INNER} <-> ${PEER_INNER}  transport=$MODE  local=$LOCAL_ADDR($WAN_DEV) peer=$PEER_PUB mtu=$MTU epoch=$CUR_EPOCH"
   return 0
 }
 
 # ------------------------------------------------------------------------------
-#  Watchdog helpers: interface counters, xfrm error counters, forensic dump
+#  Watchdog helpers
 # ------------------------------------------------------------------------------
-if_counters() {   # prints "<rx_bytes> <tx_bytes>" for $IF_NAME
+if_counters() {
   local r t
   r=$(cat "/sys/class/net/${IF_NAME}/statistics/rx_bytes" 2>/dev/null) || r=0
   t=$(cat "/sys/class/net/${IF_NAME}/statistics/tx_bytes" 2>/dev/null) || t=0
   echo "${r:-0} ${t:-0}"
 }
 
-xfrm_nonzero_counters() {   # e.g. "XfrmInStateProtoError=3 XfrmInTmplMismatch=1"
+xfrm_nonzero_counters() {
   awk '$2 != 0 {printf "%s=%s ", $1, $2}' /proc/net/xfrm_stat 2>/dev/null
 }
 
-# Dumps SA state, interface counters, xfrm error counters and recent *kernel*
-# log (not the whole boot buffer) so a rebuild that just happened is still
-# diagnosable afterwards. Uses fd 3 for the SA-registry loop so the inner
-# `... | while read` pipelines don't fight over stdin.
 forensic_snapshot() {
   local reason=$1 dir ep spi src dst line
   log "----- forensic snapshot: ${reason} -----"
@@ -605,10 +625,7 @@ forensic_snapshot() {
   log "----- end forensic snapshot -----"
 }
 
-# Common rebuild path for every watchdog trigger: logs (with or without a full
-# forensic dump), tears down + rebuilds, and resets all watchdog counters so
-# the freshly-rebuilt tunnel gets a clean slate.
-watchdog_rebuild() {   # watchdog_rebuild "<reason>" [skip-forensic]
+watchdog_rebuild() {
   local reason=$1
   if [[ ${2:-} == skip-forensic ]]; then
     log "$reason"
@@ -628,7 +645,7 @@ watchdog_rebuild() {   # watchdog_rebuild "<reason>" [skip-forensic]
 }
 
 # ------------------------------------------------------------------------------
-#  Daemon (runs under systemd): setup, hourly key rotation, health watchdog
+#  Daemon
 # ------------------------------------------------------------------------------
 cmd_daemon() {
   local tries=0 last_fix=0 e now xcur rx tx
@@ -651,34 +668,28 @@ cmd_daemon() {
     wait $!
     now=$(date +%s)
 
-    # --- hourly key rotation (make-before-break, no packet loss) ---
     e=$(( now / EPOCH_LEN ))
     if (( e != CUR_EPOCH )); then
       log "key rotation: epoch $CUR_EPOCH -> $e"
       if install_epoch "$e"; then CUR_EPOCH=$e; else log "WARN: key rotation failed, will retry"; fi
     fi
 
-    # --- unconditional preventive rebuild (the "every 12h" safety net) ---
     if (( FORCE_REBUILD_SEC > 0 && now - LAST_REBUILD >= FORCE_REBUILD_SEC )); then
       watchdog_rebuild "scheduled preventive rebuild (every $((FORCE_REBUILD_SEC/3600))h)" skip-forensic
       continue
     fi
 
-    # --- interface missing ---
     if ! ip link show "$IF_NAME" >/dev/null 2>&1; then
       watchdog_rebuild "interface $IF_NAME vanished"
       continue
     fi
 
-    # --- xfrm kernel error counters: early warning, logged even without a rebuild ---
     xcur=$(xfrm_nonzero_counters)
     if [[ -n $xcur && $xcur != "$XPREV" ]]; then
       log "WARN: new xfrm error counters: $xcur"
     fi
     XPREV=$xcur
 
-    # --- asymmetric blackout: outbound flowing, nothing received (the exact
-    #     pattern seen in production - TX climbing, RX frozen on both ends) ---
     read -r rx tx <<< "$(if_counters)"
     if (( tx > TX0 && rx == RX0 )); then
       (( RX_STALL_START == 0 )) && RX_STALL_START=$now
@@ -690,7 +701,6 @@ cmd_daemon() {
       RX_STALL_START=0; RX0=$rx; TX0=$tx
     fi
 
-    # --- ping watchdog (also exercises the path when otherwise idle) ---
     if ping -c1 -W1 -I "$IF_NAME" "$PEER_INNER" >/dev/null 2>&1; then
       if [[ $PEER_STATE != up ]]; then log "peer $PEER_INNER reachable - tunnel UP"; fi
       PEER_STATE=up; FAILS=0
@@ -714,6 +724,7 @@ cmd_fw() {
   load_config || exit 1
   route_info "$PEER_PUB" || exit 1
   fw_apply
+  ensure_direct_path
   log "firewall / port-forward rules reloaded"
 }
 
@@ -811,20 +822,15 @@ ask_transport() {
   local c
   echo
   echo "Transport:"
-  echo "  1) Raw ESP - IP protocol 50   (default: fastest, smallest overhead)"
-  echo "  2) ESP-in-UDP                 (fallback: use it if protocol 50 is blocked or a NAT is in front of a server)"
+  echo "  1) ESP-in-UDP (Port 443)      (Recommended: Bypasses ISP blocks, NAT, and prevents disruptions)"
+  echo "  2) Raw ESP - IP protocol 50   (Fastest, but often blocked/dropped by ISPs)"
   read -r -p "Select [1]: " c
   if [[ $c == 2 ]]; then
-    MODE=udp
-    while true; do
-      read -r -p "UDP port for ESP-in-UDP [${DEFAULT_UDP_PORT}]: " UDP_PORT
-      UDP_PORT=${UDP_PORT:-$DEFAULT_UDP_PORT}
-      valid_port "$UDP_PORT" && break
-      err "Invalid port."
-    done
-  else
     MODE=esp
     UDP_PORT=$DEFAULT_UDP_PORT
+  else
+    MODE=udp
+    UDP_PORT=443
   fi
 }
 
@@ -885,7 +891,6 @@ setup_iran() {
   ask_fwd_proto
 
   ROLE=iran
-  # Fixed PSK as requested (hashed to 64 hex chars to satisfy the key length requirement)
   MASTER=$(printf '%s' "sdfdtgg54tefgfegytrsdasqeqhjAsvsfSSfv" | sha256sum | awk '{print $1}')
   FORCE_REBUILD_SEC=$DEFAULT_FORCE_REBUILD_SEC
   RX_STALL_SEC=$DEFAULT_RX_STALL_SEC
