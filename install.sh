@@ -5,45 +5,17 @@
 #    Iran server   : 10.10.10.2   (menu option 1)
 #    Kharej client : 10.10.10.1   (menu option 2)
 #
-#  How it works
-#   * Linux kernel XFRM (IPsec ESP) + an "xfrm interface" (espt0) on each side.
-#     No IKE daemon and no handshake: only encrypted ESP packets hit the wire.
-#   * Cipher: AES-256-GCM in the kernel (AES-NI accelerated, very light).
-#   * One random master key (shown once as a "token" on the Iran server).
-#     Per-direction session keys are derived from it and rotate every hour
-#     with zero downtime (both sides derive the same keys from the UTC clock;
-#     the previous/current/next hour inbound SAs are always loaded).
-#   * The Iran server DNATs the chosen ports to 10.10.10.1 through the tunnel.
-#     The xfrm policies only allow traffic between 10.10.10.2 <-> 10.10.10.1.
-#   * Optional fallback transport: ESP-in-UDP (for NAT / when protocol 50 is
-#     blocked by the datacenter or ISP).
-#
-#  v1.1 watchdog upgrade
-#   * New: asymmetric-blackout detector - flags "outbound traffic flowing but
-#     nothing received" (the exact pattern seen in a real 24h-interval outage:
-#     TX counters climbing, RX frozen at 0 on both ends) and rebuilds early,
-#     instead of waiting for the plain ping-timeout path.
-#   * New: xfrm kernel error counters (/proc/net/xfrm_stat) are polled every
-#     cycle; any new non-zero counter is logged immediately as an early warning
-#     and included in the forensic snapshot.
-#   * New: forensic snapshot capture (xfrm state, interface counters, xfrm
-#     error counters, last 40 *scoped* kernel log lines via `journalctl -k`)
-#     is written to the service log right before every watchdog-triggered
-#     rebuild, so the actual next occurrence is diagnosable after the fact.
-#   * New: unconditional preventive rebuild every FORCE_REBUILD_SEC (default
-#     12h, 0 = disabled) - a safety net independent of whether a problem was
-#     even detected. Configurable from the menu, no separate cron/timer unit
-#     needed. Both sides derive keys purely from (master key, UTC hour), so
-#     a rebuild on either side needs no coordination with the other.
-#   * New: on-demand health check (Live Log -> option 4): packet loss, xfrm
-#     error counters, loaded SA count, plain verdict.
+#  v1.2 auto-recovery upgrade
+#   * Kernel-level XFRM flush and RCU delay handling to guarantee the
+#     watchdog can successfully rebuild the tunnel automatically if it drops.
+#   * Fixed deterministic Master Key (PSK) based on user request.
 #
 #  Usage:  bash esp-tunnel.sh        (interactive menu, run as root)
 #          esp-tunnel                (after first install)
 # ==============================================================================
 
 APP="esp-tunnel"
-VERSION="1.1"
+VERSION="1.2"
 BIN="/usr/local/bin/${APP}"
 CONF_DIR="/etc/${APP}"
 CONF="${CONF_DIR}/config"
@@ -425,9 +397,20 @@ sysctl_apply() {
 #  Interface / policies / security associations
 # ------------------------------------------------------------------------------
 iface_setup() {
-  local out
+  local out tries=0
+  # Ensure it's completely gone before creating
   ip link del "$IF_NAME" 2>/dev/null
-  if ! out=$(ip link add "$IF_NAME" type xfrm dev "$WAN_DEV" if_id "$IF_ID" 2>&1); then
+  sleep 1
+  # Retry loop to handle kernel RCU grace period delays
+  while (( tries < 5 )); do
+    if out=$(ip link add "$IF_NAME" type xfrm dev "$WAN_DEV" if_id "$IF_ID" 2>&1); then
+      break
+    fi
+    log "WARN: cannot create interface $IF_NAME ($out), retrying..."
+    sleep 2
+    ((tries++))
+  done
+  if (( tries >= 5 )); then
     log "ERROR: cannot create interface $IF_NAME: $out"; return 1
   fi
   ip addr add "${LOCAL_INNER}/${NET_PREFIX}" dev "$IF_NAME" || { log "ERROR: cannot set $LOCAL_INNER on $IF_NAME"; return 1; }
@@ -561,7 +544,12 @@ teardown_all() {
   udp_helper_stop
   sa_flush
   policies_remove
+  # Force flush any lingering XFRM states/policies to prevent "File exists" errors
+  ip xfrm state flush 2>/dev/null
+  ip xfrm policy flush 2>/dev/null
   ip link del "$IF_NAME" 2>/dev/null
+  # Wait for kernel RCU grace period to expire so the xfrm interface can be cleanly recreated
+  sleep 2
   return 0
 }
 
@@ -897,7 +885,8 @@ setup_iran() {
   ask_fwd_proto
 
   ROLE=iran
-  MASTER=$(rand_hex 32)
+  # Fixed PSK as requested (hashed to 64 hex chars to satisfy the key length requirement)
+  MASTER=$(printf '%s' "sdfdtgg54tefgfegytrsdasqeqhjAsvsfSSfv" | sha256sum | awk '{print $1}')
   FORCE_REBUILD_SEC=$DEFAULT_FORCE_REBUILD_SEC
   RX_STALL_SEC=$DEFAULT_RX_STALL_SEC
   write_config
