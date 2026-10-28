@@ -54,6 +54,7 @@ LOCAL_INNER=""; PEER_INNER=""; PEER_PUB=""; OUT_LABEL=""; IN_LABEL=""; MTU="$MTU
 GRE_LOCAL=""; GRE_PEER=""; XFRM_LOCAL=""; XFRM_PEER=""
 LOCAL_ADDR=""; WAN_DEV=""; CUR_EPOCH=0
 FORCE_REBUILD_SEC="$DEFAULT_FORCE_REBUILD_SEC"; RX_STALL_SEC="$DEFAULT_RX_STALL_SEC"
+GRE_SUPPORTED=0   # set by check_kernel(); used by ask_transport()/auto_select_transport()
 
 # ---- daemon watchdog state (globals; meaningful only while cmd_daemon runs) --
 RX0=0; TX0=0; RX_STALL_START=0; LAST_REBUILD=0; FAILS=0; PEER_STATE="unknown"; XPREV=""
@@ -192,13 +193,7 @@ detect_public_ip() {
 # ------------------------------------------------------------------------------
 #  Config
 # ------------------------------------------------------------------------------
-load_config() {
-  [[ -r $CONF ]] || return 1
-  # shellcheck disable=SC1090
-  source "$CONF"
-  MODE=${MODE:-esp}; UDP_PORT=${UDP_PORT:-$DEFAULT_UDP_PORT}; FWD_PROTO=${FWD_PROTO:-both}
-  FORCE_REBUILD_SEC=${FORCE_REBUILD_SEC:-$DEFAULT_FORCE_REBUILD_SEC}
-  RX_STALL_SEC=${RX_STALL_SEC:-$DEFAULT_RX_STALL_SEC}
+derive_role_vars() {   # fills LOCAL_INNER/PEER_INNER/PEER_PUB/GRE_LOCAL/GRE_PEER/... from ROLE+IRAN_IP+KHAREJ_IP
   case $ROLE in
     iran)
       LOCAL_INNER=$IP_IRAN;   PEER_INNER=$IP_KHAREJ; PEER_PUB=$KHAREJ_IP; OUT_LABEL=i2k; IN_LABEL=k2i
@@ -210,6 +205,17 @@ load_config() {
       ;;
     *) return 1 ;;
   esac
+  return 0
+}
+
+load_config() {
+  [[ -r $CONF ]] || return 1
+  # shellcheck disable=SC1090
+  source "$CONF"
+  MODE=${MODE:-esp}; UDP_PORT=${UDP_PORT:-$DEFAULT_UDP_PORT}; FWD_PROTO=${FWD_PROTO:-both}
+  FORCE_REBUILD_SEC=${FORCE_REBUILD_SEC:-$DEFAULT_FORCE_REBUILD_SEC}
+  RX_STALL_SEC=${RX_STALL_SEC:-$DEFAULT_RX_STALL_SEC}
+  derive_role_vars || return 1
   [[ -n $MASTER && -n $PEER_PUB ]] || return 1
   if [[ $MODE == udp ]]; then
     MTU=$MTU_UDP
@@ -282,7 +288,7 @@ ensure_deps() {
   for c in ip iptables ping ss sha256sum sha512sum base64 awk od head; do
     have "$c" || missing+=("$c")
   done
-  if [[ $MODE == udp ]] && ! have python3; then missing+=(python3); fi
+  have python3 || missing+=(python3)   # needed for the ESP-in-UDP helper (udp mode, incl. auto-test)
   (( ${#missing[@]} == 0 )) && return 0
 
   if   have apt-get; then pm=apt
@@ -334,14 +340,16 @@ check_kernel() {
     return 1
   fi
   ip link del "$t" 2>/dev/null
-  if [[ $MODE == gre ]]; then
+
+  ip link del "$g" 2>/dev/null
+  if out=$(ip link add "$g" type gre local 127.0.0.2 remote 127.0.0.3 ttl 64 2>&1); then
+    GRE_SUPPORTED=1
     ip link del "$g" 2>/dev/null
-    if ! out=$(ip link add "$g" type gre local 127.0.0.2 remote 127.0.0.3 ttl 64 2>&1); then
-      err "Kernel lacks GRE (Protocol 47) tunnel support: $out"
-      return 1
-    fi
-    ip link del "$g" 2>/dev/null
+  else
+    GRE_SUPPORTED=0
+    warn "Kernel lacks GRE (Protocol 47) tunnel support: $out - the GRE transport will be skipped."
   fi
+
   k=$(printf '%072d' 0)
   if ! out=$(ip xfrm state add src 127.0.0.2 dst 127.0.0.3 proto esp spi 0x1c0ffee0 mode tunnel \
              aead 'rfc4106(gcm(aes))' "0x$k" 128 2>&1); then
@@ -528,21 +536,23 @@ gre_setup() {
 }
 
 iface_setup() {
-  local out tries=0
+  local out tries=0 base_dev
   if [[ $MODE == gre ]]; then
     gre_setup || return 1
     XFRM_LOCAL=$GRE_LOCAL
     XFRM_PEER=$GRE_PEER
+    base_dev=$GRE_IF          # ESP outer packets travel over the GRE tunnel, not WAN_DEV directly
   else
     ip link del "$GRE_IF" 2>/dev/null
     XFRM_LOCAL=$LOCAL_ADDR
     XFRM_PEER=$PEER_PUB
+    base_dev=$WAN_DEV
   fi
 
   ip link del "$IF_NAME" 2>/dev/null
   sleep 0.5
   while (( tries < 5 )); do
-    if out=$(ip link add "$IF_NAME" type xfrm dev "$WAN_DEV" if_id "$IF_ID" 2>&1); then
+    if out=$(ip link add "$IF_NAME" type xfrm dev "$base_dev" if_id "$IF_ID" 2>&1); then
       break
     fi
     log "WARN: cannot create interface $IF_NAME ($out), retrying..."
@@ -983,6 +993,7 @@ ask_transport() {
   echo "  1) ESP-in-UDP (Port 443)       (Recommended: Bypasses ISP blocks, NAT, and prevents disruptions)"
   echo "  2) Raw ESP - IP protocol 50    (Fastest, but often blocked/dropped by ISPs)"
   echo "  3) Protocol 47 (GRE Tunnel)    (Anti-Firewall: Encapsulates tunnel over IP Protocol 47)"
+  echo "  4) Auto  (bring up each mode for real against the peer, keep whichever is actually stable)"
   read -r -p "Select [3]: " c
   case ${c:-3} in
     1)
@@ -993,11 +1004,87 @@ ask_transport() {
       MODE=esp
       UDP_PORT=$DEFAULT_UDP_PORT
       ;;
+    4)
+      MODE=auto
+      ;;
     *)
       MODE=gre
       UDP_PORT=$DEFAULT_UDP_PORT
       ;;
   esac
+}
+
+mode_label() {
+  case $1 in
+    udp) echo "ESP-in-UDP (443)" ;;
+    esp) echo "Raw ESP (proto 50)" ;;
+    gre) echo "Protocol 47 (GRE)" ;;
+    *)   echo "$1" ;;
+  esac
+}
+
+# Brings up each candidate transport for real (iface+policies+SA+firewall), pings the peer's
+# inner tunnel IP to measure actual loss, tears it down, and keeps the best-performing one.
+# Requires ROLE/MASTER/IRAN_IP/KHAREJ_IP/PORTS/FWD_PROTO and derive_role_vars() to already be set,
+# since it calls setup_all()/teardown_all() directly (outside the systemd service).
+auto_select_transport() {
+  local -a candidates=()
+  local m loss best_mode="" best_loss=101 tested=0
+
+  if (( GRE_SUPPORTED == 1 )); then
+    candidates=(udp gre esp)
+  else
+    candidates=(udp esp)
+  fi
+
+  echo
+  info "Auto mode: bringing up each transport against ${PEER_PUB} and measuring real packet loss (~8s each)..."
+  echo
+
+  for m in "${candidates[@]}"; do
+    MODE=$m
+    case $m in
+      udp) UDP_PORT=443;               MTU=$MTU_UDP ;;
+      gre) UDP_PORT=$DEFAULT_UDP_PORT; MTU=$MTU_GRE ;;
+      esp) UDP_PORT=$DEFAULT_UDP_PORT; MTU=$MTU_ESP ;;
+    esac
+
+    printf '  %-22s ' "$(mode_label "$m")"
+    if ! setup_all >/tmp/.espt-auto.log 2>&1; then
+      echo "${C_R}setup failed${C_0}"
+      teardown_all >/dev/null 2>&1
+      continue
+    fi
+    sleep 2
+    loss=$(ping -c 6 -i 0.4 -W 1 -I "$IF_NAME" "$PEER_INNER" 2>/dev/null | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
+    [[ -z $loss ]] && loss=100
+    teardown_all >/dev/null 2>&1
+    tested=$((tested + 1))
+
+    if   (( loss == 0 ));   then echo "${C_G}${loss}% loss${C_0}"
+    elif (( loss < 100 ));  then echo "${C_Y}${loss}% loss${C_0}"
+    else                         echo "${C_R}no response${C_0}"
+    fi
+
+    if (( loss < best_loss )); then best_loss=$loss; best_mode=$m; fi
+  done
+  echo
+
+  if (( tested == 0 || best_loss >= 100 )); then
+    warn "No reply from the peer on any transport - it's probably not installed/running on the other side yet."
+    if (( GRE_SUPPORTED == 1 )); then MODE=gre; UDP_PORT=$DEFAULT_UDP_PORT; MTU=$MTU_GRE
+    else                              MODE=udp; UDP_PORT=443;              MTU=$MTU_UDP
+    fi
+    warn "Using $(mode_label "$MODE") for now. Once the OTHER side is also installed and running, run this installer there with option 4 (Auto) too - it will test against this server (now live) and lock onto whichever mode actually works."
+  else
+    MODE=$best_mode
+    case $MODE in
+      udp) UDP_PORT=443;               MTU=$MTU_UDP ;;
+      gre) UDP_PORT=$DEFAULT_UDP_PORT; MTU=$MTU_GRE ;;
+      esp) UDP_PORT=$DEFAULT_UDP_PORT; MTU=$MTU_ESP ;;
+    esac
+    ok "Selected: $(mode_label "$MODE")  (${best_loss}% loss in the test)"
+  fi
 }
 
 ask_fwd_proto() {
@@ -1031,9 +1118,6 @@ setup_iran() {
 
   echo
   info "Setting up the IRAN server side (tunnel IP ${IP_IRAN})"
-  ask_transport
-  ensure_deps  || { pause; return; }
-  check_kernel || { pause; return; }
 
   det=$(detect_public_ip)
   while true; do
@@ -1048,6 +1132,10 @@ setup_iran() {
     valid_ip "$KHAREJ_IP" && break
     err "Invalid IPv4 address."
   done
+
+  ROLE=iran
+  derive_role_vars
+
   if ! route_info "$KHAREJ_IP"; then err "No route to $KHAREJ_IP from this server."; pause; return; fi
   if [[ $LOCAL_ADDR != "$IRAN_IP" ]]; then
     warn "This server's local address towards Kharej is $LOCAL_ADDR, not $IRAN_IP (NAT?)."
@@ -1058,12 +1146,28 @@ setup_iran() {
   ask_ports
   ask_fwd_proto
 
-  ROLE=iran
   MASTER=$(printf '%s' "sdfdtgg54tefgfegytrsdasqeqhjAsvsfSSfv" | sha256sum | awk '{print $1}')
   FORCE_REBUILD_SEC=$DEFAULT_FORCE_REBUILD_SEC
   RX_STALL_SEC=$DEFAULT_RX_STALL_SEC
+
+  ensure_deps  || { pause; return; }
+  check_kernel || { pause; return; }
+
+  while true; do
+    ask_transport
+    if [[ $MODE == auto ]]; then
+      auto_select_transport
+      break
+    elif [[ $MODE == gre && $GRE_SUPPORTED -ne 1 ]]; then
+      err "This kernel doesn't support GRE tunnels - pick a different transport."
+      continue
+    else
+      break
+    fi
+  done
+
   write_config
-  load_config
+  load_config || { err "internal error writing config"; pause; return; }
   start_service || { pause; return; }
   print_token
   echo
@@ -1089,10 +1193,6 @@ setup_kharej() {
   fi
   ok "Fixed token loaded automatically (no token prompt needed)."
 
-  ask_transport
-  ensure_deps  || { pause; return; }
-  check_kernel || { pause; return; }
-
   det=$(detect_public_ip)
   while true; do
     read -r -p "Iran server public IP [${T_IRAN}]: " IRAN_IP
@@ -1107,8 +1207,8 @@ setup_kharej() {
     err "Invalid IPv4 address."
   done
 
-  UDP_PORT=${UDP_PORT:-$T_UDP}
   PORTS=$(norm_ports "$T_PORTS"); FWD_PROTO=$T_PROTO; MASTER=$T_MASTER; ROLE=kharej
+  derive_role_vars
   FORCE_REBUILD_SEC=$DEFAULT_FORCE_REBUILD_SEC
   RX_STALL_SEC=$DEFAULT_RX_STALL_SEC
 
@@ -1118,8 +1218,24 @@ setup_kharej() {
     confirm "Continue anyway?" y || return
   fi
 
+  ensure_deps  || { pause; return; }
+  check_kernel || { pause; return; }
+
+  while true; do
+    ask_transport
+    if [[ $MODE == auto ]]; then
+      auto_select_transport
+      break
+    elif [[ $MODE == gre && $GRE_SUPPORTED -ne 1 ]]; then
+      err "This kernel doesn't support GRE tunnels - pick a different transport."
+      continue
+    else
+      break
+    fi
+  done
+
   write_config
-  load_config
+  load_config || { err "internal error writing config"; pause; return; }
   start_service || { pause; return; }
 
   echo
