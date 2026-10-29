@@ -1,28 +1,26 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  ESP Tunnel Manager  -  point-to-point tunnel over IP protocol 50 (ESP) / 47 (GRE)
+#  ESP Tunnel Manager  -  point-to-point tunnel over UDP / Proto 50 (ESP) / 47 (GRE)
 #
 #    Iran server   : 10.0.0.2   (menu option 1)
 #    Kharej client : 10.0.0.1   (menu option 2)
 #
-#  v1.6 No-Crypto (cipher_null) & Anti-Packet-Loss Edition
-#   * Mod: Disabled AES-GCM encryption (uses cipher_null / digest_null) for
-#     zero CPU crypto overhead and smaller packet footprint.
-#   * Fix: Added replay-window 0 to prevent out-of-order packet drops across
-#     high-jitter Iran-Kharej links.
-#   * Fix: Replaced hourly epoch SPI rotation with static deterministic SPIs so
-#     clock drift between Iran and Kharej never drops packets.
-#   * Fix: Atomic XFRM state/policy updates in soft_recover() instead of
-#     destructive delete/re-add cycles.
-#   * Fix: Scoped TCPMSS clamping strictly to the tunnel interface and tuned
-#     MTU/BBR/queues to eliminate fragmentation blackholes.
+#  v1.7 No-Crypto (cipher_null), Direct-GRE & Anti-Packet-Loss Edition
+#   * Fix: Resolved iptables nf_tables "multiple --in-interface options not allowed"
+#     error in ESPT_PRE by splitting interface/peer exclusions into RETURN rules.
+#   * Mod: AES encryption disabled (uses cipher_null / digest_null & replay-window 0).
+#   * Fix: GRE mode (Protocol 47) now runs as a clean, single-layer direct GRE
+#     tunnel on espt0 instead of stacking redundant unencrypted ESP inside GRE.
+#   * Fix: ESP-in-UDP mode now defaults to port 4500 (configurable) with built-in
+#     10s UDP keepalive to avoid ISP QUIC-443 throttling and NAT state timeouts.
+#   * Fix: Multi-probe watchdog ping (-c 3 -i 0.2) to prevent false-positive rebuilds.
 #
 #  Usage:  bash esp-tunnel.sh        (interactive menu, run as root)
 #          esp-tunnel                (after first install)
 # ==============================================================================
 
 APP="esp-tunnel"
-VERSION="1.6"
+VERSION="1.7"
 BIN="/usr/local/bin/${APP}"
 CONF_DIR="/etc/${APP}"
 CONF="${CONF_DIR}/config"
@@ -37,24 +35,21 @@ SHARED_SECRET="123"
 IF_NAME="espt0"
 IF_ID=42
 GRE_IF="espgre0"
-GRE_IRAN="100.64.47.2"
-GRE_KHAREJ="100.64.47.1"
-GRE_PREFIX=30
 IP_IRAN="10.0.0.2"
 IP_KHAREJ="10.0.0.1"
 NET_PREFIX=30
-MTU_ESP=1360
-MTU_UDP=1340
-MTU_GRE=1320
+MTU_ESP=1380
+MTU_UDP=1360
+MTU_GRE=1420
 DEFAULT_UDP_PORT=4500
-DEFAULT_FORCE_REBUILD_SEC=0       # 0 = disabled by default to avoid unnecessary disruption
+DEFAULT_FORCE_REBUILD_SEC=0       # 0 = disabled by default
 DEFAULT_RX_STALL_SEC=60           # seconds of "tx moving, rx frozen" before soft recovery
 
 # ---- runtime state (filled by load_config) -----------------------------------
-ROLE=""; MASTER=""; IRAN_IP=""; KHAREJ_IP=""; MODE="esp"; UDP_PORT="$DEFAULT_UDP_PORT"
+ROLE=""; MASTER=""; IRAN_IP=""; KHAREJ_IP=""; MODE="udp"; UDP_PORT="$DEFAULT_UDP_PORT"
 PORTS=""; FWD_PROTO="both"
-LOCAL_INNER=""; PEER_INNER=""; PEER_PUB=""; OUT_LABEL=""; IN_LABEL=""; MTU="$MTU_ESP"
-GRE_LOCAL=""; GRE_PEER=""; XFRM_LOCAL=""; XFRM_PEER=""
+LOCAL_INNER=""; PEER_INNER=""; PEER_PUB=""; OUT_LABEL=""; IN_LABEL=""; MTU="$MTU_UDP"
+XFRM_LOCAL=""; XFRM_PEER=""
 LOCAL_ADDR=""; WAN_DEV=""; CUR_EPOCH=0
 FORCE_REBUILD_SEC="$DEFAULT_FORCE_REBUILD_SEC"; RX_STALL_SEC="$DEFAULT_RX_STALL_SEC"
 GRE_SUPPORTED=0
@@ -63,8 +58,9 @@ GRE_SUPPORTED=0
 RX0=0; TX0=0; RX_STALL_START=0; LAST_REBUILD=0; FAILS=0; PEER_STATE="unknown"; XPREV=""
 
 PY_UDP='
-import socket, sys
+import socket, sys, time
 port = int(sys.argv[1])
+peer = sys.argv[2] if len(sys.argv) > 2 else ""
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
@@ -74,7 +70,16 @@ except Exception:
     pass
 s.bind(("0.0.0.0", port))
 s.setsockopt(socket.IPPROTO_UDP, 100, 2)   # UDP_ENCAP = UDP_ENCAP_ESPINUDP
+s.settimeout(10.0)
+last_ka = 0.0
 while True:
+    now = time.monotonic()
+    if peer and now - last_ka >= 10.0:
+        try:
+            s.sendto(b"\xff", (peer, port))
+        except Exception:
+            pass
+        last_ka = now
     try:
         s.recvfrom(65535)
     except Exception:
@@ -198,11 +203,9 @@ derive_role_vars() {
   case $ROLE in
     iran)
       LOCAL_INNER=$IP_IRAN;   PEER_INNER=$IP_KHAREJ; PEER_PUB=$KHAREJ_IP; OUT_LABEL=i2k; IN_LABEL=k2i
-      GRE_LOCAL=$GRE_IRAN;    GRE_PEER=$GRE_KHAREJ
       ;;
     kharej)
       LOCAL_INNER=$IP_KHAREJ; PEER_INNER=$IP_IRAN;   PEER_PUB=$IRAN_IP;   OUT_LABEL=k2i; IN_LABEL=i2k
-      GRE_LOCAL=$GRE_KHAREJ;  GRE_PEER=$GRE_IRAN
       ;;
     *) return 1 ;;
   esac
@@ -213,7 +216,7 @@ load_config() {
   [[ -r $CONF ]] || return 1
   # shellcheck disable=SC1090
   source "$CONF"
-  MODE=${MODE:-esp}; UDP_PORT=${UDP_PORT:-$DEFAULT_UDP_PORT}; FWD_PROTO=${FWD_PROTO:-both}
+  MODE=${MODE:-udp}; UDP_PORT=${UDP_PORT:-$DEFAULT_UDP_PORT}; FWD_PROTO=${FWD_PROTO:-both}
   FORCE_REBUILD_SEC=${FORCE_REBUILD_SEC:-$DEFAULT_FORCE_REBUILD_SEC}
   RX_STALL_SEC=${RX_STALL_SEC:-$DEFAULT_RX_STALL_SEC}
   derive_role_vars || return 1
@@ -379,21 +382,23 @@ fw_apply() {
     ipt -A ESPT_IN -p udp -s "$PEER_PUB" --sport "$UDP_PORT" -j ACCEPT
   elif [[ $MODE == gre ]]; then
     ipt -A ESPT_IN -p 47 -s "$PEER_PUB" -j ACCEPT
-    ipt -A ESPT_IN -i "$GRE_IF" -p 50 -j ACCEPT
-    ipt -A ESPT_IN -i "$GRE_IF" -j ACCEPT
   else
     ipt -A ESPT_IN -p 50 -s "$PEER_PUB" -j ACCEPT
   fi
 
-  # Bypass conntrack on raw outer tunnel packets to prevent state table exhaustion/locks
+  # Bypass conntrack on raw outer tunnel packets to prevent state table locks
   if ipt -t raw -L -n >/dev/null 2>&1; then
     fw_chain_reset raw ESPT_RAW_PRE PREROUTING
     fw_chain_reset raw ESPT_RAW_OUT OUTPUT
     if [[ $MODE == gre ]]; then
+      ipt -t raw -A ESPT_RAW_PRE -p 47 -s "$PEER_PUB" -j CT --notrack 2>/dev/null || \
       ipt -t raw -A ESPT_RAW_PRE -p 47 -s "$PEER_PUB" -j NOTRACK 2>/dev/null
+      ipt -t raw -A ESPT_RAW_OUT -p 47 -d "$PEER_PUB" -j CT --notrack 2>/dev/null || \
       ipt -t raw -A ESPT_RAW_OUT -p 47 -d "$PEER_PUB" -j NOTRACK 2>/dev/null
     elif [[ $MODE == esp ]]; then
+      ipt -t raw -A ESPT_RAW_PRE -p 50 -s "$PEER_PUB" -j CT --notrack 2>/dev/null || \
       ipt -t raw -A ESPT_RAW_PRE -p 50 -s "$PEER_PUB" -j NOTRACK 2>/dev/null
+      ipt -t raw -A ESPT_RAW_OUT -p 50 -d "$PEER_PUB" -j CT --notrack 2>/dev/null || \
       ipt -t raw -A ESPT_RAW_OUT -p 50 -d "$PEER_PUB" -j NOTRACK 2>/dev/null
     fi
   fi
@@ -405,14 +410,18 @@ fw_apply() {
   # Clamp TCP MSS strictly on tunnel interface traffic
   fw_chain_reset mangle ESPT_MSS FORWARD
   fw_chain_reset mangle ESPT_MSS POSTROUTING
-  ipt -t mangle -A ESPT_MSS -o "$IF_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
   ipt -t mangle -A ESPT_MSS -o "$IF_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss_val"
-  ipt -t mangle -A ESPT_MSS -i "$IF_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
   ipt -t mangle -A ESPT_MSS -i "$IF_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss_val"
 
   if [[ $ROLE == iran ]]; then
     fw_chain_reset nat ESPT_PRE  PREROUTING
     fw_chain_reset nat ESPT_POST POSTROUTING
+
+    # Separate RETURN rules (avoids nf_tables "multiple --in-interface" error and protects outer tunnel packets)
+    ipt -t nat -A ESPT_PRE -s "$PEER_PUB" -j RETURN
+    ipt -t nat -A ESPT_PRE -i "$IF_NAME" -j RETURN
+    ipt -t nat -A ESPT_PRE -i lo -j RETURN
+
     case $FWD_PROTO in
       tcp) protos=(tcp) ;;
       udp) protos=(udp) ;;
@@ -423,7 +432,7 @@ fw_apply() {
       [[ -z $spec ]] && continue
       d=${spec/-/:}
       for pr in "${protos[@]}"; do
-        ipt -t nat -A ESPT_PRE ! -i "$IF_NAME" ! -i lo -p "$pr" --dport "$d" -j DNAT --to-destination "$IP_KHAREJ"
+        ipt -t nat -A ESPT_PRE -p "$pr" --dport "$d" -j DNAT --to-destination "$IP_KHAREJ"
       done
     done
     ipt -t nat -A ESPT_POST -o "$IF_NAME" -d "$IP_KHAREJ" -j SNAT --to-source "$IP_IRAN"
@@ -452,7 +461,6 @@ net.core.netdev_budget_usecs = 8000
 EOF
   sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1
   sysctl -qw "net.ipv4.conf.${IF_NAME}.rp_filter=0" >/dev/null 2>&1
-  [[ -n $GRE_IF ]] && sysctl -qw "net.ipv4.conf.${GRE_IF}.rp_filter=0" >/dev/null 2>&1
   return 0
 }
 
@@ -461,20 +469,18 @@ EOF
 # ------------------------------------------------------------------------------
 ensure_direct_path() {
   local mss_val=$(( MTU - 40 ))
-  log "Applying direct-path and anti-disruption network fixes..."
 
-  # 1. Fix MTU/PMTU Blackholes strictly on tunnel interface
-  ipt -t mangle -F ESPT_MSS 2>/dev/null
-  ipt -t mangle -A ESPT_MSS -o "$IF_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
-  ipt -t mangle -A ESPT_MSS -o "$IF_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss_val"
-  ipt -t mangle -A ESPT_MSS -i "$IF_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
-  ipt -t mangle -A ESPT_MSS -i "$IF_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss_val"
+  # 1. Ensure MSS rules exist without flushing live traffic unnecessarily
+  if ! ipt -t mangle -C ESPT_MSS -o "$IF_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss_val" 2>/dev/null; then
+    ipt -t mangle -F ESPT_MSS 2>/dev/null
+    ipt -t mangle -A ESPT_MSS -o "$IF_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss_val" 2>/dev/null
+    ipt -t mangle -A ESPT_MSS -i "$IF_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss_val" 2>/dev/null
+  fi
 
   # 2. Disable Reverse Path Filtering on tunnel interfaces
   sysctl -qw net.ipv4.conf.all.rp_filter=0 2>/dev/null
   sysctl -qw net.ipv4.conf.default.rp_filter=0 2>/dev/null
   sysctl -qw "net.ipv4.conf.${IF_NAME}.rp_filter=0" 2>/dev/null
-  [[ -n $GRE_IF ]] && sysctl -qw "net.ipv4.conf.${GRE_IF}.rp_filter=0" 2>/dev/null
   [[ -n $WAN_DEV ]] && sysctl -qw "net.ipv4.conf.${WAN_DEV}.rp_filter=0" 2>/dev/null
 
   # 3. Disable ICMP Redirects
@@ -485,71 +491,51 @@ ensure_direct_path() {
   # 4. Force static route to peer public IP
   local gw
   gw=$(ip -4 route get "$PEER_PUB" 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="via"){print $(i+1); exit}}')
-  if [[ -n $gw && -n $WAN_DEV && $WAN_DEV != "$IF_NAME" && $WAN_DEV != "$GRE_IF" ]]; then
+  if [[ -n $gw && -n $WAN_DEV && $WAN_DEV != "$IF_NAME" ]]; then
     ip route replace "$PEER_PUB" via "$gw" dev "$WAN_DEV" src "$LOCAL_ADDR" 2>/dev/null || \
     ip route replace "$PEER_PUB" dev "$WAN_DEV" src "$LOCAL_ADDR" 2>/dev/null
   fi
 
-  # 5. Increase conntrack & socket buffers to prevent dropped packets under load
+  # 5. Increase conntrack & socket buffers
   sysctl -qw net.netfilter.nf_conntrack_max=1048576 2>/dev/null
   sysctl -qw net.core.rmem_max=33554432 2>/dev/null
   sysctl -qw net.core.wmem_max=33554432 2>/dev/null
   sysctl -qw net.core.netdev_max_backlog=32768 2>/dev/null
-
-  log "Direct-path optimizations applied successfully."
 }
 
 # ------------------------------------------------------------------------------
 #  Interface / policies / security associations
 # ------------------------------------------------------------------------------
-gre_setup() {
-  local out
-  ip link del "$GRE_IF" 2>/dev/null
-  if ! out=$(ip link add "$GRE_IF" type gre local "$LOCAL_ADDR" remote "$PEER_PUB" ttl 64 nopmtudisc 2>&1); then
-    out=$(ip link add "$GRE_IF" type gre local "$LOCAL_ADDR" remote "$PEER_PUB" ttl 64 2>&1) || {
-      log "ERROR: cannot create GRE (Protocol 47) interface $GRE_IF: $out"
-      return 1
-    }
-  fi
-  ip addr add "${GRE_LOCAL}/${GRE_PREFIX}" dev "$GRE_IF" || {
-    log "ERROR: cannot set ${GRE_LOCAL} on $GRE_IF"
-    return 1
-  }
-  ip link set "$GRE_IF" txqueuelen 4000 mtu 1400 up || {
-    log "ERROR: cannot bring $GRE_IF up"
-    return 1
-  }
-  sysctl -qw "net.ipv4.conf.${GRE_IF}.rp_filter=0" >/dev/null 2>&1
-  return 0
-}
-
 iface_setup() {
-  local out tries=0 base_dev
+  local out tries=0
+  ip link del "$GRE_IF" 2>/dev/null
+  ip link del "$IF_NAME" 2>/dev/null
+  sleep 0.2
+
   if [[ $MODE == gre ]]; then
-    gre_setup || return 1
-    XFRM_LOCAL=$GRE_LOCAL
-    XFRM_PEER=$GRE_PEER
-    base_dev=$GRE_IF
+    # Direct single-layer GRE interface on espt0 (no redundant XFRM ESP layer inside GRE)
+    if ! out=$(ip link add "$IF_NAME" type gre local "$LOCAL_ADDR" remote "$PEER_PUB" ttl 64 nopmtudisc 2>&1); then
+      out=$(ip link add "$IF_NAME" type gre local "$LOCAL_ADDR" remote "$PEER_PUB" ttl 64 2>&1) || {
+        log "ERROR: cannot create GRE interface $IF_NAME: $out"
+        return 1
+      }
+    fi
   else
-    ip link del "$GRE_IF" 2>/dev/null
     XFRM_LOCAL=$LOCAL_ADDR
     XFRM_PEER=$PEER_PUB
-    base_dev=$WAN_DEV
+    while (( tries < 5 )); do
+      if out=$(ip link add "$IF_NAME" type xfrm dev "$WAN_DEV" if_id "$IF_ID" 2>&1); then
+        break
+      fi
+      log "WARN: cannot create interface $IF_NAME ($out), retrying..."
+      sleep 1
+      ((tries++))
+    done
+    if (( tries >= 5 )); then
+      log "ERROR: cannot create interface $IF_NAME: $out"; return 1
+    fi
   fi
 
-  ip link del "$IF_NAME" 2>/dev/null
-  sleep 0.3
-  while (( tries < 5 )); do
-    if out=$(ip link add "$IF_NAME" type xfrm dev "$base_dev" if_id "$IF_ID" 2>&1); then
-      break
-    fi
-    log "WARN: cannot create interface $IF_NAME ($out), retrying..."
-    sleep 1
-    ((tries++))
-  done
-  if (( tries >= 5 )); then
-    log "ERROR: cannot create interface $IF_NAME: $out"; return 1
-  fi
   ip addr add "${LOCAL_INNER}/${NET_PREFIX}" dev "$IF_NAME" || { log "ERROR: cannot set $LOCAL_INNER on $IF_NAME"; return 1; }
   ip link set "$IF_NAME" txqueuelen 4000 mtu "$MTU" up || { log "ERROR: cannot bring $IF_NAME up"; return 1; }
   return 0
@@ -568,6 +554,7 @@ policies_remove() {
 }
 
 policies_setup() {
+  [[ $MODE == gre ]] && return 0
   local out
   out=$(ip xfrm policy update src "$LOCAL_INNER/32" dst "$PEER_INNER/32" dir out if_id "$IF_ID" \
         tmpl src "$XFRM_LOCAL" dst "$XFRM_PEER" proto esp reqid "$IF_ID" mode tunnel 2>&1) \
@@ -588,7 +575,6 @@ sa_add() {
   else                       src=$XFRM_PEER;  dst=$XFRM_LOCAL; label=$IN_LABEL
   fi
 
-  # Deterministic static SPI (independent of system clock) + cipher_null (no AES) + replay-window 0
   spi="0x1$(kdf "${MASTER}|spi|${label}" | cut -c1-7)"
   args=(src "$src" dst "$dst" proto esp spi "$spi" reqid "$IF_ID" mode tunnel
         enc cipher_null "" auth digest_null "" replay-window 0)
@@ -606,6 +592,10 @@ sa_add() {
 install_epoch() {
   local e=${1:-0}
   : > "$REG"
+  if [[ $MODE == gre ]]; then
+    echo "gre 0 direct $LOCAL_ADDR $PEER_PUB" > "$REG"
+    return 0
+  fi
   sa_add out "$e" || return 1
   sa_add in  "$e" || return 1
   return 0
@@ -615,7 +605,7 @@ sa_flush() {
   local dir ep spi src dst
   if [[ -f $REG ]]; then
     while read -r dir ep spi src dst; do
-      [[ -n $spi ]] && ip xfrm state delete src "$src" dst "$dst" proto esp spi "$spi" 2>/dev/null
+      [[ -n $spi && $spi != direct ]] && ip xfrm state delete src "$src" dst "$dst" proto esp spi "$spi" 2>/dev/null
     done < "$REG"
   fi
   rm -f "$REG"
@@ -630,9 +620,9 @@ udp_helper_stop() {
 
 udp_helper_start() {
   udp_helper_stop
-  python3 -c "$PY_UDP" "$UDP_PORT" >/dev/null 2>&1 &
+  python3 -c "$PY_UDP" "$UDP_PORT" "$PEER_PUB" >/dev/null 2>&1 &
   echo $! > "$UDP_PID_FILE"
-  sleep 0.7
+  sleep 0.6
   if ! kill -0 "$(cat "$UDP_PID_FILE")" 2>/dev/null; then
     log "ERROR: cannot open UDP port $UDP_PORT for ESP-in-UDP (already in use?)"
     return 1
@@ -649,7 +639,7 @@ teardown_all() {
   ip xfrm policy flush 2>/dev/null
   ip link del "$IF_NAME" 2>/dev/null
   ip link del "$GRE_IF" 2>/dev/null
-  sleep 0.5
+  sleep 0.3
   return 0
 }
 
@@ -665,14 +655,14 @@ setup_all() {
   load_modules
   route_info "$PEER_PUB" || { log "ERROR: no route to peer $PEER_PUB"; return 1; }
   sysctl_apply
-  fw_apply
-  iface_setup           || return 1
-  policies_setup        || return 1
+  if [[ $MODE == udp ]]; then udp_helper_start || return 1; fi
+  iface_setup            || return 1
+  policies_setup         || return 1
   CUR_EPOCH=0
   install_epoch "$CUR_EPOCH" || return 1
-  if [[ $MODE == udp ]]; then udp_helper_start || return 1; fi
+  fw_apply
   ensure_direct_path
-  log "tunnel up: role=$ROLE ${LOCAL_INNER} <-> ${PEER_INNER}  transport=$MODE  cipher=null  local=$LOCAL_ADDR($WAN_DEV) peer=$PEER_PUB mtu=$MTU"
+  log "tunnel up: role=$ROLE ${LOCAL_INNER} <-> ${PEER_INNER}  transport=$MODE$( [[ $MODE == udp ]] && echo "($UDP_PORT)" )  cipher=null  local=$LOCAL_ADDR($WAN_DEV) peer=$PEER_PUB mtu=$MTU"
   return 0
 }
 
@@ -690,17 +680,13 @@ xfrm_nonzero_counters() {
   awk '$2 != 0 {printf "%s=%s ", $1, $2}' /proc/net/xfrm_stat 2>/dev/null
 }
 
+peer_ping_ok() {
+  ping -c 3 -i 0.2 -W 1 -I "$IF_NAME" "$PEER_INNER" >/dev/null 2>&1
+}
+
 forensic_snapshot() {
-  local reason=$1 dir ep spi src dst line
+  local reason=$1 line
   log "----- forensic snapshot: ${reason} -----"
-  if [[ -s $REG ]]; then
-    while read -r dir ep spi src dst <&3; do
-      [[ -n $spi ]] || continue
-      ip xfrm state get src "$src" dst "$dst" proto esp spi "$spi" 2>&1 | while IFS= read -r line; do
-        log "xfrm-state (${dir}): ${line}"
-      done
-    done 3< "$REG"
-  fi
   ip -s link show "$IF_NAME" 2>&1 | while IFS= read -r line; do log "link: ${line}"; done
   local x; x=$(xfrm_nonzero_counters)
   log "xfrm error counters: ${x:-none (clean)}"
@@ -709,13 +695,7 @@ forensic_snapshot() {
 
 soft_recover() {
   route_info "$PEER_PUB" || return 1
-  if [[ $MODE == gre ]]; then
-    if ! ip link show "$GRE_IF" >/dev/null 2>&1; then
-      gre_setup || return 1
-    fi
-    XFRM_LOCAL=$GRE_LOCAL
-    XFRM_PEER=$GRE_PEER
-  else
+  if [[ $MODE != gre ]]; then
     XFRM_LOCAL=$LOCAL_ADDR
     XFRM_PEER=$PEER_PUB
   fi
@@ -725,7 +705,7 @@ soft_recover() {
   policies_setup || return 1
   install_epoch 0 || return 1
   ensure_direct_path
-  ping -c 2 -W 1 -I "$IF_NAME" "$PEER_INNER" >/dev/null 2>&1
+  peer_ping_ok
 }
 
 watchdog_rebuild() {
@@ -790,23 +770,20 @@ cmd_daemon() {
       continue
     fi
 
-    if [[ $MODE == gre ]] && ! ip link show "$GRE_IF" >/dev/null 2>&1; then
-      watchdog_rebuild "GRE interface $GRE_IF vanished"
-      continue
+    if [[ $MODE != gre ]]; then
+      xcur=$(xfrm_nonzero_counters)
+      if [[ -n $xcur && $xcur != "$XPREV" ]]; then
+        log "WARN: new xfrm error counters: $xcur"
+      fi
+      XPREV=$xcur
     fi
-
-    xcur=$(xfrm_nonzero_counters)
-    if [[ -n $xcur && $xcur != "$XPREV" ]]; then
-      log "WARN: new xfrm error counters: $xcur"
-    fi
-    XPREV=$xcur
 
     read -r rx tx <<< "$(if_counters)"
     if (( tx > TX0 && rx == RX0 )); then
       (( RX_STALL_START == 0 )) && RX_STALL_START=$now
       TX0=$tx
       if (( now - RX_STALL_START >= RX_STALL_SEC )); then
-        if ! ping -c 2 -W 1 -I "$IF_NAME" "$PEER_INNER" >/dev/null 2>&1; then
+        if ! peer_ping_ok; then
           watchdog_rebuild "asymmetric blackout: no inbound traffic for ${RX_STALL_SEC}s while outbound is active"
           continue
         else
@@ -818,7 +795,7 @@ cmd_daemon() {
       RX_STALL_START=0; RX0=$rx; TX0=$tx
     fi
 
-    if ping -c1 -W1 -I "$IF_NAME" "$PEER_INNER" >/dev/null 2>&1; then
+    if peer_ping_ok; then
       if [[ $PEER_STATE != up ]]; then log "peer $PEER_INNER reachable - tunnel UP"; fi
       PEER_STATE=up; FAILS=0
     else
@@ -864,7 +841,7 @@ install_self() {
 write_unit() {
   cat > "$UNIT_FILE" <<EOF
 [Unit]
-Description=ESP (IP protocol 50 / GRE 47) tunnel (${APP})
+Description=ESP (UDP / IP protocol 50 / GRE 47) tunnel (${APP})
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -937,19 +914,27 @@ ask_ports() {
 }
 
 ask_transport() {
-  local c gre_note=""
+  local c up gre_note=""
   (( GRE_SUPPORTED == 1 )) || gre_note="  [NOT supported by this kernel]"
   echo
   echo "Transport:"
-  echo "  1) ESP-in-UDP (Port 443)       (Recommended: Bypasses ISP blocks, NAT, and prevents disruptions)"
-  echo "  2) Raw ESP - IP protocol 50    (Fastest, but often blocked/dropped by ISPs)"
-  echo "  3) Protocol 47 (GRE Tunnel)    (Anti-Firewall: Encapsulates tunnel over IP Protocol 47)${gre_note}"
-  echo "  4) Auto  (bring up each mode for real against the peer, keep whichever is actually stable)"
-  read -r -p "Select [3]: " c
-  case ${c:-3} in
+  echo "  1) ESP-in-UDP (No-Crypto)      (Recommended: Bypasses ISP Proto 47/50 drops & NAT)"
+  echo "  2) Raw ESP - IP protocol 50    (Direct IP Proto 50 without encryption)"
+  echo "  3) Protocol 47 (Direct GRE)    (Single-layer pure GRE tunnel)${gre_note}"
+  echo "  4) Auto  (test each mode against peer, keep whichever has lowest loss)"
+  read -r -p "Select [1]: " c
+  case ${c:-1} in
     1)
       MODE=udp
-      UDP_PORT=443
+      while true; do
+        read -r -p "UDP tunnel port (must match on both servers, avoid 443 due to QUIC filter) [${DEFAULT_UDP_PORT}]: " up
+        up=${up:-$DEFAULT_UDP_PORT}
+        if valid_port "$up"; then
+          UDP_PORT=$up
+          break
+        fi
+        err "Invalid UDP port (1-65535)."
+      done
       ;;
     2)
       MODE=esp
@@ -967,9 +952,9 @@ ask_transport() {
 
 mode_label() {
   case $1 in
-    udp) echo "ESP-in-UDP (443)" ;;
+    udp) echo "ESP-in-UDP (${UDP_PORT})" ;;
     esp) echo "Raw ESP (proto 50)" ;;
-    gre) echo "Protocol 47 (GRE)" ;;
+    gre) echo "Direct GRE (proto 47)" ;;
     *)   echo "$1" ;;
   esac
 }
@@ -991,12 +976,12 @@ auto_select_transport() {
   for m in "${candidates[@]}"; do
     MODE=$m
     case $m in
-      udp) UDP_PORT=443;                MTU=$MTU_UDP ;;
+      udp) UDP_PORT=$DEFAULT_UDP_PORT; MTU=$MTU_UDP ;;
       gre) UDP_PORT=$DEFAULT_UDP_PORT; MTU=$MTU_GRE ;;
       esp) UDP_PORT=$DEFAULT_UDP_PORT; MTU=$MTU_ESP ;;
     esac
 
-    printf '  %-22s ' "$(mode_label "$m")"
+    printf '  %-24s ' "$(mode_label "$m")"
     if ! setup_all >/tmp/.espt-auto.log 2>&1; then
       echo "${C_R}setup failed${C_0}"
       teardown_all >/dev/null 2>&1
@@ -1019,14 +1004,12 @@ auto_select_transport() {
 
   if (( tested == 0 || best_loss >= 100 )); then
     warn "No reply from the peer on any transport - it's probably not installed/running on the other side yet."
-    if (( GRE_SUPPORTED == 1 )); then MODE=gre; UDP_PORT=$DEFAULT_UDP_PORT; MTU=$MTU_GRE
-    else                              MODE=udp; UDP_PORT=443;               MTU=$MTU_UDP
-    fi
-    warn "Using $(mode_label "$MODE") for now. Once the OTHER side is also installed and running, run this installer there with option 4 (Auto) too."
+    MODE=udp; UDP_PORT=$DEFAULT_UDP_PORT; MTU=$MTU_UDP
+    warn "Defaulting to $(mode_label "$MODE"). Make sure both servers use the SAME transport mode."
   else
     MODE=$best_mode
     case $MODE in
-      udp) UDP_PORT=443;                MTU=$MTU_UDP ;;
+      udp) UDP_PORT=$DEFAULT_UDP_PORT; MTU=$MTU_UDP ;;
       gre) UDP_PORT=$DEFAULT_UDP_PORT; MTU=$MTU_GRE ;;
       esp) UDP_PORT=$DEFAULT_UDP_PORT; MTU=$MTU_ESP ;;
     esac
@@ -1073,7 +1056,6 @@ setup_iran() {
   if ! route_info "$KHAREJ_IP"; then err "No route to $KHAREJ_IP from this server."; pause; return; fi
   if [[ $LOCAL_ADDR != "$IRAN_IP" ]]; then
     warn "This server's local address towards Kharej is $LOCAL_ADDR, not $IRAN_IP (NAT?)."
-    warn "Raw ESP through NAT often fails - if it does, re-install using ESP-in-UDP or Protocol 47."
   fi
 
   echo
@@ -1104,8 +1086,7 @@ setup_iran() {
   load_config || { err "internal error writing config"; pause; return; }
   start_service || { pause; return; }
   echo
-  ok "No token to copy. Just run option 2 of this same script on the Kharej server."
-  warn "Pick the SAME transport number (or Auto) there as you picked here."
+  ok "Setup complete on Iran. Now run option 2 on the Kharej server with the SAME transport."
   echo "Forwarding: [${PORTS}] (${FWD_PROTO}) on this server  ->  ${IP_KHAREJ} through the tunnel."
   echo
   pause
@@ -1182,13 +1163,13 @@ cmd_status() {
   echo "Role          : $ROLE   (${LOCAL_INNER}  <->  ${PEER_INNER})"
   echo "Peer public IP: $PEER_PUB"
   if [[ $MODE == udp ]]; then
-    echo "Transport     : ESP-in-UDP, port $UDP_PORT"
+    echo "Transport     : ESP-in-UDP (port $UDP_PORT, cipher_null)"
   elif [[ $MODE == gre ]]; then
-    echo "Transport     : Protocol 47 (GRE Encapsulation via $GRE_IF)"
+    echo "Transport     : Protocol 47 (Direct Single-Layer GRE on $IF_NAME)"
   else
-    echo "Transport     : raw ESP (IP protocol 50)"
+    echo "Transport     : Raw ESP (IP protocol 50, cipher_null)"
   fi
-  echo "Cipher        : NULL (Encryption Disabled - cipher_null), MTU $MTU, replay-window 0"
+  echo "Cipher        : Disabled (Plain / No-AES), MTU $MTU"
   echo "Watchdog      : rx-stall trigger ${RX_STALL_SEC}s, preventive rebuild $( (( FORCE_REBUILD_SEC > 0 )) && echo "every $((FORCE_REBUILD_SEC/3600))h" || echo disabled)"
   if [[ $st == active ]]; then echo "Service       : ${C_G}active${C_0}"; else echo "Service       : ${C_R}${st}${C_0}"; fi
 
@@ -1197,26 +1178,20 @@ cmd_status() {
   else
     echo "Interface     : ${C_R}$IF_NAME missing${C_0}"
   fi
-  if [[ $MODE == gre ]]; then
-    if ip link show "$GRE_IF" >/dev/null 2>&1; then
-      echo "GRE Interface : $(ip -br addr show "$GRE_IF" | awk '{print $1, $2, $3}')"
-    else
-      echo "GRE Interface : ${C_R}$GRE_IF missing${C_0}"
-    fi
-  fi
-  echo "Loaded SAs    : $(wc -l < "$REG" 2>/dev/null || echo 0)  (1 outbound + 1 inbound expected)"
   echo
   echo "--- Ping through the tunnel (10 packets) ---"
   ping -c 10 -i 0.2 -W 1 -I "$IF_NAME" "$PEER_INNER" 2>&1 | tail -n 2
   echo
   echo "--- Interface counters ---"
   ip -s link show "$IF_NAME" 2>/dev/null | sed -n '3,6p'
-  echo
-  line=$(awk '$2 != 0 {printf "%s=%s ", $1, $2}' /proc/net/xfrm_stat 2>/dev/null)
-  if [[ -n $line ]]; then
-    echo "XFRM counters (non-zero = drops/errors): $line"
-  else
-    echo "XFRM counters : clean (no errors)"
+  if [[ $MODE != gre ]]; then
+    echo
+    line=$(awk '$2 != 0 {printf "%s=%s ", $1, $2}' /proc/net/xfrm_stat 2>/dev/null)
+    if [[ -n $line ]]; then
+      echo "XFRM counters : $line"
+    else
+      echo "XFRM counters : clean (no errors)"
+    fi
   fi
   if [[ $ROLE == iran ]]; then
     echo
@@ -1254,12 +1229,11 @@ health_check() {
   echo "Interface    : $(ip -br link show "$IF_NAME" 2>/dev/null || echo "${IF_NAME} missing")"
   x=$(xfrm_nonzero_counters)
   echo "XFRM errors  : ${x:-none (clean)}"
-  echo "SAs loaded   : $(wc -l < "$REG" 2>/dev/null || echo 0) (expect 2: 1 outbound + 1 inbound)"
   echo
   if [[ -z $loss ]]; then
     echo "${C_R}Verdict: could not measure (ping did not run)${C_0}"
-  elif (( loss == 0 )) && [[ -z $x ]]; then
-    echo "${C_G}Verdict: healthy (0% loss, no xfrm errors)${C_0}"
+  elif (( loss == 0 )); then
+    echo "${C_G}Verdict: healthy (0% loss)${C_0}"
   elif (( loss < 50 )); then
     echo "${C_Y}Verdict: degraded (${loss}% loss)${C_0}"
   else
@@ -1336,8 +1310,8 @@ change_watchdog() {
 banner() {
   [[ -t 1 ]] && clear
   echo "${C_B}==============================================================${C_0}"
-  echo "${C_B}   ESP Tunnel Manager v${VERSION}  -  No-Crypto (cipher_null)${C_0}"
-  echo "${C_B}   Iran ${IP_IRAN}  <=======  ESP  =======>  Kharej ${IP_KHAREJ}${C_0}"
+  echo "${C_B}   ESP Tunnel Manager v${VERSION}  -  No-Crypto & Direct-GRE${C_0}"
+  echo "${C_B}   Iran ${IP_IRAN}  <=======  TUN  =======>  Kharej ${IP_KHAREJ}${C_0}"
   echo "${C_B}==============================================================${C_0}"
   if load_config 2>/dev/null; then
     echo " Installed role: $ROLE ($MODE)   |   service: $(systemctl is-active "$APP" 2>/dev/null)"
