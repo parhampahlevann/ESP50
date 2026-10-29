@@ -5,19 +5,29 @@
 #    Iran server   : 10.0.0.2   (menu option 1)
 #    Kharej client : 10.0.0.1   (menu option 2)
 #
-#  v1.4 Direct-Path, Protocol 47 (GRE) & Anti-Disruption upgrade
+#  v1.5 Direct-Path, Protocol 47 (GRE) & Anti-Disruption upgrade
 #   * New: ensure_direct_path() function to fix MTU blackholes, asymmetric
 #     routing drops, and ISP ICMP redirects.
 #   * New: Transport options include ESP-in-UDP (port 443), Raw ESP (proto 50),
 #     and Protocol 47 (GRE encapsulation) to bypass ISP/Datacenter blocks.
-#   * New: Built-in fixed token for automatic setup without token prompts.
+#   * New: Built-in fixed shared secret (SHARED_SECRET) - no token is ever
+#     asked for or shown; Iran and Kharej derive the same key from it.
+#   * Fix: Iran used to derive its master key from one hardcoded passphrase
+#     while Kharej decoded the same value from a separate embedded base64
+#     token; both paths happened to agree, but any future edit to only one
+#     of them would have silently broken the tunnel. Both roles now call the
+#     same compute_master(), so there is exactly one place this key comes
+#     from.
+#   * Fix: the token's embedded transport mode/port (T_MODE/T_UDP) were
+#     parsed but never actually applied on the Kharej side - dead code,
+#     removed. Pick the same transport option (or Auto) on both sides.
 #
 #  Usage:  bash esp-tunnel.sh        (interactive menu, run as root)
 #          esp-tunnel                (after first install)
 # ==============================================================================
 
 APP="esp-tunnel"
-VERSION="1.4"
+VERSION="1.5"
 BIN="/usr/local/bin/${APP}"
 CONF_DIR="/etc/${APP}"
 CONF="${CONF_DIR}/config"
@@ -27,7 +37,13 @@ RUN_DIR="/run/${APP}"
 REG="${RUN_DIR}/sa.list"
 UDP_PID_FILE="${RUN_DIR}/udp.pid"
 
-DEFAULT_TOKEN="djF8OTg1YjFkNzk5N2M1YTk2OTljNWY0Nzk3NDQ0YmUxMzRlOGZiMTNjNTczMzcxMDE4MmMyOWNmY2YzN2Y3OWQyMnwzNy4yMDIuMjI1LjQ4fDc4LjIzMi4xMjguNDl8ZXNwfDQ1MDB8MjM5MDJ8dGNwfGE1OTE0YQ=="
+# Pre-shared secret baked into the script. Iran and Kharej both derive the
+# SAME AES-256-GCM master key from this one value (see compute_master()),
+# so the tunnel comes up with zero prompts and nothing is ever printed on
+# screen. If you hand this script to other people, change this string (and
+# reinstall both sides) - otherwise every install sharing this value also
+# shares the same tunnel keys.
+SHARED_SECRET="123"
 
 IF_NAME="espt0"
 IF_ID=42
@@ -248,34 +264,8 @@ write_config() {
   chmod 600 "$CONF"
 }
 
-make_token() {
-  local payload chk
-  if [[ -n $DEFAULT_TOKEN ]]; then
-    printf '%s' "$DEFAULT_TOKEN"
-    return 0
-  fi
-  payload="v1|${MASTER}|${IRAN_IP}|${KHAREJ_IP}|${MODE}|${UDP_PORT}|${PORTS}|${FWD_PROTO}"
-  chk=$(printf '%s' "$payload" | sha256sum | cut -c1-6)
-  printf '%s|%s' "$payload" "$chk" | base64 -w0
-}
-
-T_MASTER=""; T_IRAN=""; T_KHAREJ=""; T_MODE=""; T_UDP=""; T_PORTS=""; T_PROTO=""
-parse_token() {
-  local t dec ver chk want
-  t=$(tr -d '[:space:]' <<<"$1")
-  [[ -n $t ]] || return 1
-  dec=$(base64 -d <<<"$t" 2>/dev/null) || return 1
-  IFS='|' read -r ver T_MASTER T_IRAN T_KHAREJ T_MODE T_UDP T_PORTS T_PROTO chk <<<"$dec"
-  [[ $ver == v1 ]] || return 1
-  want=$(printf '%s' "${ver}|${T_MASTER}|${T_IRAN}|${T_KHAREJ}|${T_MODE}|${T_UDP}|${T_PORTS}|${T_PROTO}" | sha256sum | cut -c1-6)
-  [[ $chk == "$want" ]] || return 1
-  [[ $T_MASTER =~ ^[0-9a-f]{64}$ ]] || return 1
-  valid_ip "$T_IRAN" && valid_ip "$T_KHAREJ" || return 1
-  [[ $T_MODE == esp || $T_MODE == udp || $T_MODE == gre ]] || return 1
-  valid_port "$T_UDP" || return 1
-  [[ $T_PROTO == tcp || $T_PROTO == udp || $T_PROTO == both ]] || return 1
-  norm_ports "$T_PORTS" >/dev/null || return 1
-  return 0
+compute_master() {   # derives the shared AES-256-GCM master key from SHARED_SECRET
+  printf '%s' "$SHARED_SECRET" | sha256sum | awk '{print $1}'
 }
 
 # ------------------------------------------------------------------------------
@@ -987,12 +977,13 @@ ask_ports() {
 }
 
 ask_transport() {
-  local c
+  local c gre_note=""
+  (( GRE_SUPPORTED == 1 )) || gre_note="  [NOT supported by this kernel]"
   echo
   echo "Transport:"
   echo "  1) ESP-in-UDP (Port 443)       (Recommended: Bypasses ISP blocks, NAT, and prevents disruptions)"
   echo "  2) Raw ESP - IP protocol 50    (Fastest, but often blocked/dropped by ISPs)"
-  echo "  3) Protocol 47 (GRE Tunnel)    (Anti-Firewall: Encapsulates tunnel over IP Protocol 47)"
+  echo "  3) Protocol 47 (GRE Tunnel)    (Anti-Firewall: Encapsulates tunnel over IP Protocol 47)${gre_note}"
   echo "  4) Auto  (bring up each mode for real against the peer, keep whichever is actually stable)"
   read -r -p "Select [3]: " c
   case ${c:-3} in
@@ -1096,16 +1087,6 @@ ask_fwd_proto() {
   case $c in 2) FWD_PROTO=tcp ;; 3) FWD_PROTO=udp ;; *) FWD_PROTO=both ;; esac
 }
 
-print_token() {
-  local tok
-  tok=$(make_token)
-  echo
-  echo "${C_Y}================= TOKEN (secret - contains the encryption key) =================${C_0}"
-  echo "$tok"
-  echo "${C_Y}=================================================================================${C_0}"
-  echo "Fixed token is already pre-configured in this script for automatic setup on Kharej."
-}
-
 # ------------------------------------------------------------------------------
 #  Menu actions
 # ------------------------------------------------------------------------------
@@ -1114,21 +1095,18 @@ setup_iran() {
   confirm_reinstall || return
   install_self || { pause; return; }
 
-  parse_token "$DEFAULT_TOKEN" 2>/dev/null || true
-
   echo
   info "Setting up the IRAN server side (tunnel IP ${IP_IRAN})"
 
   det=$(detect_public_ip)
   while true; do
-    read -r -p "Iran server public IP [${det:-${T_IRAN:-37.202.225.48}}]: " IRAN_IP
-    IRAN_IP=${IRAN_IP:-${det:-${T_IRAN:-37.202.225.48}}}
+    read -r -p "Iran server public IP [${det}]: " IRAN_IP
+    IRAN_IP=${IRAN_IP:-$det}
     valid_ip "$IRAN_IP" && break
     err "Invalid IPv4 address."
   done
   while true; do
-    read -r -p "Kharej (foreign) server public IP [${T_KHAREJ:-78.232.128.49}]: " KHAREJ_IP
-    KHAREJ_IP=${KHAREJ_IP:-${T_KHAREJ:-78.232.128.49}}
+    read -r -p "Kharej (foreign) server public IP: " KHAREJ_IP
     valid_ip "$KHAREJ_IP" && break
     err "Invalid IPv4 address."
   done
@@ -1146,7 +1124,7 @@ setup_iran() {
   ask_ports
   ask_fwd_proto
 
-  MASTER=$(printf '%s' "sdfdtgg54tefgfegytrsdasqeqhjAsvsfSSfv" | sha256sum | awk '{print $1}')
+  MASTER=$(compute_master)
   FORCE_REBUILD_SEC=$DEFAULT_FORCE_REBUILD_SEC
   RX_STALL_SEC=$DEFAULT_RX_STALL_SEC
 
@@ -1169,8 +1147,9 @@ setup_iran() {
   write_config
   load_config || { err "internal error writing config"; pause; return; }
   start_service || { pause; return; }
-  print_token
   echo
+  ok "No token to copy. Just run option 2 of this same script on the Kharej server."
+  warn "Pick the SAME transport number (or Auto) there as you picked here - a mismatch is the #1 reason the two sides never link up."
   echo "Forwarding: [${PORTS}] (${FWD_PROTO}) on this server  ->  ${IP_KHAREJ} through the tunnel."
   echo "Your services on Kharej must listen on 0.0.0.0 or ${IP_KHAREJ} (not only 127.0.0.1)."
   echo "Open the tunnel protocol ($( [[ $MODE == gre ]] && echo "IP proto 47 (GRE)" || ([[ $MODE == udp ]] && echo "UDP ${UDP_PORT}" || echo "IP proto 50 (ESP)") )) in your provider's external firewall if it has one."
@@ -1179,35 +1158,27 @@ setup_iran() {
 }
 
 setup_kharej() {
-  local tok det
+  local det
   confirm_reinstall || return
   install_self || { pause; return; }
 
   echo
   info "Setting up the KHAREJ client side (tunnel IP ${IP_KHAREJ})"
-  tok="$DEFAULT_TOKEN"
-  if ! parse_token "$tok"; then
-    err "Built-in token validation failed."
-    pause
-    return
-  fi
-  ok "Fixed token loaded automatically (no token prompt needed)."
 
   det=$(detect_public_ip)
   while true; do
-    read -r -p "Iran server public IP [${T_IRAN}]: " IRAN_IP
-    IRAN_IP=${IRAN_IP:-$T_IRAN}
+    read -r -p "Iran server public IP: " IRAN_IP
     valid_ip "$IRAN_IP" && break
     err "Invalid IPv4 address."
   done
   while true; do
-    read -r -p "Kharej (this) server public IP [${det:-$T_KHAREJ}]: " KHAREJ_IP
-    KHAREJ_IP=${KHAREJ_IP:-${det:-$T_KHAREJ}}
+    read -r -p "Kharej (this) server public IP [${det}]: " KHAREJ_IP
+    KHAREJ_IP=${KHAREJ_IP:-$det}
     valid_ip "$KHAREJ_IP" && break
     err "Invalid IPv4 address."
   done
 
-  PORTS=$(norm_ports "$T_PORTS"); FWD_PROTO=$T_PROTO; MASTER=$T_MASTER; ROLE=kharej
+  MASTER=$(compute_master); ROLE=kharej
   derive_role_vars
   FORCE_REBUILD_SEC=$DEFAULT_FORCE_REBUILD_SEC
   RX_STALL_SEC=$DEFAULT_RX_STALL_SEC
@@ -1242,8 +1213,7 @@ setup_kharej() {
   info "Testing the tunnel (5 pings to ${PEER_INNER})..."
   ping -c 5 -i 0.3 -W 1 -I "$IF_NAME" "$PEER_INNER" 2>&1 | tail -n 3
   echo
-  echo "Services for ports [${PORTS}] on this server must listen on 0.0.0.0 or ${IP_KHAREJ}."
-  echo "Traffic arrives from ${IP_IRAN} (the Iran server's tunnel IP)."
+  echo "Traffic arrives from ${IP_IRAN} (the Iran server's tunnel IP); your services here must listen on 0.0.0.0 or ${IP_KHAREJ} (not only 127.0.0.1)."
   echo "Open the tunnel protocol ($( [[ $MODE == gre ]] && echo "IP proto 47 (GRE)" || ([[ $MODE == udp ]] && echo "UDP ${UDP_PORT}" || echo "IP proto 50 (ESP)") )) in your provider's external firewall if it has one."
   echo
   pause
@@ -1398,12 +1368,6 @@ change_ports() {
   warn "Ports updated - the Kharej side does not need to be updated."
 }
 
-show_token() {
-  load_config 2>/dev/null || { warn "Tunnel is not installed."; return; }
-  if [[ $ROLE != iran ]]; then warn "The token is created on the Iran server (it is the same key)."; return; fi
-  print_token
-}
-
 restart_tunnel() {
   load_config 2>/dev/null || { warn "Tunnel is not installed."; return; }
   systemctl restart "$APP" && ok "Restarted."
@@ -1452,8 +1416,7 @@ menu() {
     echo "  ------------------------------------"
     echo "  6) Change forwarded ports (Iran)"
     echo "  7) Restart tunnel"
-    echo "  8) Show token (Iran)"
-    echo "  9) Watchdog / preventive-rebuild settings"
+    echo "  8) Watchdog / preventive-rebuild settings"
     echo "  0) Exit"
     echo
     read -r -p "Select: " ch || exit 0
@@ -1466,8 +1429,7 @@ menu() {
       5) uninstall_all; echo; pause ;;
       6) change_ports; echo; pause ;;
       7) restart_tunnel; echo; pause ;;
-      8) show_token; echo; pause ;;
-      9) change_watchdog; echo; pause ;;
+      8) change_watchdog; echo; pause ;;
       0|q|Q) exit 0 ;;
       *) warn "Invalid choice."; sleep 1 ;;
     esac
